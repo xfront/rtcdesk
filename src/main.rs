@@ -281,6 +281,21 @@ async fn dispatch_host_message(
                     .await;
             }
         }
+        SignalMessage::QualityUpdate {
+            from,
+            quality,
+            max_dimension,
+            fps,
+            ..
+        } => {
+            info!(
+                "[{}] QualityUpdate from {}: quality={} dim={} fps={}",
+                host_id, from, quality, max_dimension, fps
+            );
+            if let Some((_, peer)) = sessions.lock().await.iter().find(|(id, _)| id == &from) {
+                peer.update_quality(quality, max_dimension, fps);
+            }
+        }
         SignalMessage::PeerJoined { id, role } => {
             info!("Peer joined: {} ({:?})", id, role);
         }

@@ -176,6 +176,8 @@ pub struct RtcPeer {
     dc_ready: Arc<tokio::sync::Notify>,
     /// Set to false by the event handler when peer disconnects.
     running: Arc<AtomicBool>,
+    /// Current target FPS (updated dynamically via QualityUpdate).
+    fps: Arc<AtomicU32>,
 }
 
 impl RtcPeer {
@@ -255,6 +257,7 @@ impl RtcPeer {
             connection_ready,
             dc_ready,
             running,
+            fps: Arc::new(AtomicU32::new(frame::DEFAULT_FPS)),
         })
     }
 
@@ -297,6 +300,7 @@ impl RtcPeer {
             connection_ready,
             dc_ready,
             running,
+            fps: Arc::new(AtomicU32::new(frame::DEFAULT_FPS)),
         })
     }
 
@@ -341,6 +345,22 @@ impl RtcPeer {
                     self.peer_id, f
                 );
             }
+        }
+    }
+
+    /// Update quality, resolution, and FPS dynamically during an active session.
+    /// Atomic writes ensure the stream loop picks up the changes immediately.
+    pub fn update_quality(&self, quality: u32, max_dimension: u32, fps: u32) {
+        if let Some(ref c) = self.capturer {
+            c.set_quality(quality.clamp(0, 100) as u8);
+            c.set_max_dimension(max_dimension);
+            self.fps.store(fps.max(1), Ordering::Relaxed);
+            info!(
+                "[{}] Quality updated: quality={} dim={} fps={}",
+                self.peer_id, quality, max_dimension, fps
+            );
+        } else {
+            warn!("[{}] No capturer; quality update ignored", self.peer_id);
         }
     }
 
@@ -475,12 +495,16 @@ impl RtcPeer {
 
     /// Start streaming desktop frames over the data channel.
     /// Waits for the ICE connection to be established before creating the data channel.
-    pub async fn start_streaming(&self, channel_label: &str, fps: u32) -> Result<()> {
+    pub async fn start_streaming(&self, channel_label: &str, initial_fps: u32) -> Result<()> {
         let capturer = self
             .capturer
             .as_ref()
             .context("no capturer attached")?
             .clone();
+
+        // Store initial FPS; future QualityUpdate messages will update this atomically
+        self.fps
+            .store(initial_fps.max(1), Ordering::Relaxed);
 
         // Wait for ICE connection to be established (with timeout)
         tokio::select! {
@@ -516,19 +540,17 @@ impl RtcPeer {
             }
         }
 
-        let interval = Duration::from_millis((1000 / fps) as u64);
+        let dynamic_fps = self.fps.clone();
         info!(
-            "[{}] Starting desktop stream at {} fps ({} ms interval)",
-            self.peer_id,
-            fps,
-            interval.as_millis()
+            "[{}] Starting desktop stream at {} fps",
+            self.peer_id, initial_fps
         );
 
         let peer_id = self.peer_id.clone();
         let running = self.running.clone();
         let pc = self.peer_connection.clone();
         tokio::spawn(async move {
-            run_stream_loop(capturer, dc, interval, running, pc).await;
+            run_stream_loop(capturer, dc, dynamic_fps, running, pc).await;
             info!("[{}] Streaming loop ended", peer_id);
         });
 
@@ -544,10 +566,11 @@ impl RtcPeer {
 }
 
 /// Core streaming loop: capture frames, chunk, send over data channel.
+/// FPS is read atomically each iteration so quality updates take effect immediately.
 async fn run_stream_loop(
     capturer: Arc<ScreenCapturer>,
     dc: Arc<dyn DataChannel>,
-    interval: Duration,
+    fps: Arc<AtomicU32>,
     running: Arc<AtomicBool>,
     pc: Arc<dyn PeerConnection>,
 ) {
@@ -558,6 +581,9 @@ async fn run_stream_loop(
             break;
         }
         let frame_start = tokio::time::Instant::now();
+
+        let current_fps = fps.load(Ordering::Relaxed).max(1);
+        let interval = Duration::from_millis((1000 / current_fps) as u64);
 
         let c = capturer.clone();
         let frame_result = tokio::task::spawn_blocking(move || c.capture_frame()).await;

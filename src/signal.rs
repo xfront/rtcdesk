@@ -47,6 +47,14 @@ pub enum SignalMessage {
         target_id: String,
         pic_quality: u32,
     },
+    /// Viewer requests a quality, resolution, or FPS update during an active session.
+    QualityUpdate {
+        from: String,
+        to: String,
+        quality: u32,
+        max_dimension: u32,
+        fps: u32,
+    },
     /// Input event (mouse/keyboard).
     Input {
         from: String,

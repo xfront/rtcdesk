@@ -165,6 +165,7 @@ impl RtcViewer {
         Ok(())
     }
 
+
     pub async fn send_mouse_event(&self, x: f64, y: f64, button: u8, pressed: bool) -> Result<()> {
         let ch = self.input_channel.lock().await;
         if let Some(ref dc) = *ch {
@@ -207,6 +208,24 @@ impl RtcViewer {
                 .map_err(|e| anyhow::anyhow!("wheel: {}", e))?;
         }
         Ok(())
+    }
+
+    /// Send a quality update (quality, max_dimension, fps) to the remote host
+    /// during an active session. The host will apply the new settings immediately.
+    pub async fn send_quality_update(
+        &self,
+        quality: u32,
+        max_dimension: u32,
+        fps: u32,
+    ) -> Result<()> {
+        let msg = SignalMessage::QualityUpdate {
+            from: self.viewer_id.clone(),
+            to: self.host_id.clone(),
+            quality,
+            max_dimension,
+            fps,
+        };
+        self.send_signaling_message(&msg).await
     }
 
     /// Send raw clipboard data to the remote host.

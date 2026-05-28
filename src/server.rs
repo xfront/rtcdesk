@@ -309,7 +309,8 @@ async fn handle_signaling_message(
             to,
             sdp: _,
         }
-        | SignalMessage::IceCandidate { from: _, to, .. } => {
+        | SignalMessage::IceCandidate { from: _, to, .. }
+        | SignalMessage::QualityUpdate { from: _, to, .. } => {
             info!("Server forwarding to '{}'", to);
             if !state.forward_message(to, text).await {
                 warn!("Failed to forward message to '{}' (peer not found)", to);

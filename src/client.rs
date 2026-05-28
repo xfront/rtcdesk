@@ -379,6 +379,8 @@ async fn run_viewer(
                 viewer.set_pic_quality(QUALITY_PRESETS[q].0);
                 viewer.set_resolution(QUALITY_PRESETS[q].2, QUALITY_PRESETS[q].3);
                 viewer.set_fps(QUALITY_PRESETS[q].4);
+                let max_dim = cmp::max(QUALITY_PRESETS[q].2, QUALITY_PRESETS[q].3);
+                let _ = viewer.send_quality_update(QUALITY_PRESETS[q].0, max_dim, QUALITY_PRESETS[q].4).await;
             }
             Some(()) = dc_rx.recv() => {
                 viewer.disconnect().await;
