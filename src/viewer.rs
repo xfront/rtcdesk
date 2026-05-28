@@ -1,0 +1,849 @@
+//! WebRTC viewer client for RTCDesk.
+
+use crate::frame::FrameAssembler;
+use crate::signal::{self, PeerRole, SignalMessage};
+use anyhow::{Context, Result};
+use bytes::BytesMut;
+use log::{error, info, warn};
+use std::cmp;
+use std::io::{Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::{Mutex, Notify};
+use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use webrtc::peer_connection::{
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration,
+    RTCConfigurationBuilder, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
+    RTCPeerConnectionState, RTCSessionDescription,
+};
+
+pub trait ViewerCallback: Send + Sync {
+    fn on_connected(&self);
+    fn on_disconnected(&self);
+    fn on_frame(&self, data: Vec<u8>, width: u32, height: u32);
+    fn on_connection_state(&self, state: String);
+    fn on_error(&self, message: String);
+    /// Called when the remote host sent text clipboard data.
+    fn on_clipboard_text(&self, text: String);
+    /// Called when the remote host sent file URIs (newline-separated file:// URIs)
+    /// after a complete file transfer.
+    fn on_clipboard_file_uris(&self, uris: String);
+}
+
+/// Discover local IP addresses for ICE host candidates.
+/// Falls back to 0.0.0.0 binding if no local IP is found.
+fn discover_udp_addrs() -> Vec<String> {
+    match local_ip_address::local_ip() {
+        Ok(ip) => vec![format!("{}:0", ip)],
+        Err(_) => vec!["0.0.0.0:0".to_string()],
+    }
+}
+
+type WsSplitSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::Message,
+>;
+
+/// Manages a single WebRTC viewer connection.
+pub struct RtcViewer {
+    ws_write: Arc<Mutex<Option<WsSplitSink>>>,
+    pc: Option<Arc<dyn PeerConnection>>,
+    viewer_id: String,
+    host_id: String,
+    callback: Option<Arc<dyn ViewerCallback>>,
+    connected: Arc<AtomicBool>,
+    input_channel: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
+    clipboard_channel: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
+    pub ws_disconnected: Arc<Notify>,
+    pic_quality: u32,     //  视频质量等级
+    fps: u32,             // 视频帧率
+    width: u32,           // 视频宽度
+    height: u32,          // 视频高度
+    bitrate: Option<u32>, // 视频比特率
+}
+
+impl RtcViewer {
+    pub fn new(viewer_id: String, host_id: String) -> Self {
+        Self {
+            ws_write: Arc::new(Mutex::new(None)),
+            pc: None,
+            viewer_id,
+            host_id,
+            callback: None,
+            connected: Arc::new(AtomicBool::new(false)),
+            input_channel: Arc::new(Mutex::new(None)),
+            clipboard_channel: Arc::new(Mutex::new(None)),
+            ws_disconnected: Arc::new(Notify::new()),
+            pic_quality: 30,
+            fps: 30,
+            width: 1280,
+            height: 720,
+            bitrate: None,
+        }
+    }
+
+    pub fn set_callback(&mut self, cb: Arc<dyn ViewerCallback>) {
+        self.callback = Some(cb);
+    }
+
+    /// 设置视频帧率
+    pub fn set_fps(&mut self, fps: u32) {
+        self.fps = fps;
+    }
+
+    pub fn set_pic_quality(&mut self, pic_quality: u32) {
+        self.pic_quality = pic_quality;
+    }
+
+    /// 设置视频分辨率
+    pub fn set_resolution(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+    }
+
+    /// 设置视频比特率（kbps）
+    pub fn set_bitrate(&mut self, bitrate: Option<u32>) {
+        self.bitrate = bitrate;
+    }
+
+    /// Build `CapturerParams` from the current viewer settings.
+    /// `max_dimension` is derived from `max(width, height)`.
+    fn capturer_params(&self) -> signal::CapturerParams {
+        signal::CapturerParams {
+            pic_quality: Some(self.pic_quality),
+            max_dimension: Some(cmp::max(self.width, self.height)),
+            fps: Some(self.fps),
+        }
+    }
+
+    pub async fn connect(&mut self, server_addr: String, stun_servers: Vec<String>) -> Result<()> {
+        let (ws_write, ws_read) = Self::connect_to_signaling(&server_addr, &self.viewer_id).await?;
+
+        let (ice_tx, ice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dc_tx, dc_rx) = tokio::sync::mpsc::unbounded_channel();
+        let pc = Self::build_peer_connection(&stun_servers, ice_tx, dc_tx, &self.viewer_id).await?;
+        self.pc = Some(pc.clone());
+
+        // Spawn handler for incoming data channels
+        spawn_dc_handler(
+            self.callback.clone(),
+            self.connected.clone(),
+            self.input_channel.clone(),
+            self.clipboard_channel.clone(),
+            dc_rx,
+        );
+
+        *self.ws_write.lock().await = Some(ws_write);
+
+        // Send connection request to signaling server
+        let req = SignalMessage::RequestConnect {
+            from: self.viewer_id.clone(),
+            target_id: self.host_id.clone(),
+        };
+        self.send_signaling_message(&req).await?;
+        info!("[{}] RequestConnect -> {}", self.viewer_id, self.host_id);
+
+        // Spawn ICE candidate forwarder
+        spawn_ice_forwarder(ice_rx, self.host_id.clone(), self.ws_write.clone());
+
+        // Spawn signaling reader (pass captured capturer params for SDP injection)
+        let v_params = self.capturer_params();
+        self.connected.store(true, Ordering::SeqCst);
+        spawn_signaling_reader(
+            ws_read,
+            self.callback.clone(),
+            self.ws_write.clone(),
+            self.pc.clone(),
+            self.viewer_id.clone(),
+            self.host_id.clone(),
+            self.connected.clone(),
+            self.ws_disconnected.clone(),
+            v_params,
+        );
+
+        Ok(())
+    }
+
+    pub async fn send_mouse_event(&self, x: f64, y: f64, button: u8, pressed: bool) -> Result<()> {
+        let ch = self.input_channel.lock().await;
+        if let Some(ref dc) = *ch {
+            let mut payload = Vec::with_capacity(19);
+            payload.push(0x01);
+            payload.extend_from_slice(&x.to_le_bytes());
+            payload.extend_from_slice(&y.to_le_bytes());
+            payload.push(button);
+            payload.push(if pressed { 1 } else { 0 });
+            dc.send(BytesMut::from(&payload[..]))
+                .await
+                .map_err(|e| anyhow::anyhow!("mouse: {}", e))?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_key_event(&self, key_code: u32, pressed: bool) -> Result<()> {
+        let ch = self.input_channel.lock().await;
+        if let Some(ref dc) = *ch {
+            let mut payload = vec![0x02u8];
+            payload.extend_from_slice(&key_code.to_le_bytes());
+            payload.push(if pressed { 1 } else { 0 });
+            dc.send(BytesMut::from(&payload[..]))
+                .await
+                .map_err(|e| anyhow::anyhow!("key: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Send raw clipboard data to the remote host.
+    pub async fn send_clipboard_data(&self, data: Vec<u8>) -> Result<()> {
+        let ch = self.clipboard_channel.lock().await;
+        if let Some(ref dc) = *ch {
+            dc.send(BytesMut::from(&data[..]))
+                .await
+                .map_err(|e| anyhow::anyhow!("clipboard: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Send file list + pre-serialized chunk data to the remote host for clipboard paste.
+    /// `file_list` is the header (including 0x03 prefix and all file metadata).
+    /// `chunks` is a flat byte array of pre-packed [0x04][index:u16][off:u64][len:u32][data]* chunks.
+    ///
+    /// Each chunk is sent as an individual DataChannel message to avoid SCTP
+    /// message size limits and allow the host to process them one at a time.
+    pub async fn send_files(&self, file_list: Vec<u8>, chunks: Vec<u8>) -> Result<()> {
+        let ch = self.clipboard_channel.lock().await;
+        if let Some(ref dc) = *ch {
+            // Send file list header (already includes 0x03 prefix)
+            dc.send(BytesMut::from(&file_list[..]))
+                .await
+                .map_err(|e| anyhow::anyhow!("file_list: {}", e))?;
+
+            // Split the flat chunks blob into individual chunk messages.
+            // Format per chunk: [0x04][file_index:u16le][offset:u64le][len:u32le][data]
+            let mut offset = 0usize;
+            while offset + 15 <= chunks.len() {
+                if chunks[offset] != 0x04 {
+                    warn!(
+                        "Expected 0x04 chunk marker at offset {}, got 0x{:02X}",
+                        offset, chunks[offset]
+                    );
+                    offset += 1;
+                    continue;
+                }
+                let data_len = u32::from_le_bytes(
+                    chunks[offset + 11..offset + 15]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                ) as usize;
+                let total = 15 + data_len;
+                if offset + total > chunks.len() {
+                    warn!("Chunk truncated at offset {}", offset);
+                    break;
+                }
+                dc.send(BytesMut::from(&chunks[offset..offset + total]))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("file_chunk: {}", e))?;
+                offset += total;
+            }
+
+            // Send complete marker
+            dc.send(BytesMut::from(&[0x05u8][..]))
+                .await
+                .map_err(|e| anyhow::anyhow!("file_complete: {}", e))?;
+        }
+        Ok(())
+    }
+
+    pub async fn disconnect(&self) {
+        self.connected.store(false, Ordering::SeqCst);
+        if let Some(ref pc) = self.pc {
+            let _ = pc.close().await;
+        }
+    }
+
+    // ── Private helpers for connect() ─────────────────────────────
+
+    async fn connect_to_signaling(
+        server_addr: &str,
+        viewer_id: &str,
+    ) -> Result<(
+        WsSplitSink,
+        futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    )> {
+        use futures_util::{SinkExt, StreamExt};
+        let ws_url = format!("ws://{}/ws", server_addr);
+        info!("[{}] Connecting to {}", viewer_id, ws_url);
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .context("failed to connect to signaling server")?;
+        let (mut ws_write, ws_read) = ws_stream.split();
+        let register = SignalMessage::Register {
+            id: viewer_id.to_string(),
+            role: PeerRole::Viewer,
+        };
+        ws_write
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&register)?.into(),
+            ))
+            .await
+            .map_err(|_| anyhow::anyhow!("register send error"))?;
+        info!("[{}] Registered", viewer_id);
+        Ok((ws_write, ws_read))
+    }
+
+    async fn build_peer_connection(
+        stun: &[String],
+        ice_tx: tokio::sync::mpsc::UnboundedSender<SignalMessage>,
+        dc_tx: tokio::sync::mpsc::UnboundedSender<Arc<dyn DataChannel>>,
+        peer_id: &str,
+    ) -> Result<Arc<dyn PeerConnection>> {
+        let handler = Arc::new(SignalingEventHandler::new(
+            ice_tx,
+            dc_tx,
+            peer_id.to_string(),
+        ));
+        let pc = PeerConnectionBuilder::new()
+            .with_configuration(build_configuration(stun))
+            .with_handler(handler)
+            .with_udp_addrs(discover_udp_addrs())
+            .build()
+            .await
+            .context("build peer connection")?;
+        Ok(Arc::from(Box::new(pc) as Box<dyn PeerConnection>))
+    }
+
+    async fn send_signaling_message(&self, msg: &SignalMessage) -> Result<()> {
+        use futures_util::SinkExt;
+        let mut ws = self.ws_write.lock().await;
+        if let Some(ref mut w) = *ws {
+            w.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(msg)?.into(),
+            ))
+            .await
+            .map_err(|_| anyhow::anyhow!("WS send error"))?;
+        }
+        Ok(())
+    }
+}
+
+// ── Spawned task helpers (free functions) ────────────────────────────
+
+fn spawn_dc_handler(
+    callback: Option<Arc<dyn ViewerCallback>>,
+    connected: Arc<AtomicBool>,
+    input_ch: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
+    clipboard_ch: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
+    mut dc_rx: tokio::sync::mpsc::UnboundedReceiver<Arc<dyn DataChannel>>,
+) {
+    tokio::spawn(async move {
+        while let Some(dc) = dc_rx.recv().await {
+            let label = dc.label().await.unwrap_or_default();
+            info!("[DC] Processing: {}", label);
+            match label.as_str() {
+                "desktop" => {
+                    tokio::spawn(assemble_desktop_frames(
+                        callback.clone(),
+                        connected.clone(),
+                        dc,
+                    ));
+                }
+                "input" => {
+                    *input_ch.lock().await = Some(dc);
+                }
+                "clipboard" => {
+                    // Store channel for sending, and also start a reader for host→viewer data
+                    let dc_read = dc.clone();
+                    *clipboard_ch.lock().await = Some(dc);
+                    tokio::spawn(viewer_clipboard_reader(
+                        dc_read,
+                        callback.clone(),
+                        connected.clone(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+async fn assemble_desktop_frames(
+    callback: Option<Arc<dyn ViewerCallback>>,
+    connected: Arc<AtomicBool>,
+    dc: Arc<dyn DataChannel>,
+) {
+    let mut assembler = FrameAssembler::new();
+    while connected.load(Ordering::Relaxed) {
+        match dc.poll().await {
+            Some(DataChannelEvent::OnMessage(msg)) => {
+                if let Some(merged) = assembler.push(&msg.data) {
+                    if merged.len() >= 8 {
+                        let w = u32::from_be_bytes([merged[0], merged[1], merged[2], merged[3]]);
+                        let h = u32::from_be_bytes([merged[4], merged[5], merged[6], merged[7]]);
+                        if let Some(ref c) = callback {
+                            c.on_frame(merged[8..].to_vec(), w, h);
+                        }
+                    }
+                }
+            }
+            Some(DataChannelEvent::OnClose) | Some(DataChannelEvent::OnError) => break,
+            None => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            _ => {}
+        }
+    }
+}
+
+// ── Viewer clipboard reader (receives host→viewer clipboard data) ─────
+
+struct ClipViewerState {
+    files: Vec<(std::path::PathBuf, std::fs::File, u64)>,
+    dir: std::path::PathBuf,
+}
+
+async fn viewer_clipboard_reader(
+    dc: Arc<dyn DataChannel>,
+    callback: Option<Arc<dyn ViewerCallback>>,
+    connected: Arc<AtomicBool>,
+) {
+    info!("[Viewer] Clipboard reader started");
+    let mut state: Option<ClipViewerState> = None;
+    while connected.load(Ordering::Relaxed) {
+        match dc.poll().await {
+            Some(DataChannelEvent::OnMessage(msg)) => {
+                if !msg.data.is_empty() {
+                    state = handle_viewer_clipboard_msg(&msg.data, state, &callback);
+                }
+            }
+            Some(DataChannelEvent::OnClose) | Some(DataChannelEvent::OnError) => {
+                info!("[Viewer] Clipboard channel closed");
+                break;
+            }
+            None => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            _ => {}
+        }
+    }
+    info!("[Viewer] Clipboard reader ended");
+}
+
+fn handle_viewer_clipboard_msg(
+    data: &[u8],
+    state: Option<ClipViewerState>,
+    callback: &Option<Arc<dyn ViewerCallback>>,
+) -> Option<ClipViewerState> {
+    match data[0] {
+        0x01 => {
+            // Text clipboard from host
+            let text = String::from_utf8_lossy(&data[1..]).to_string();
+            if let Some(c) = callback {
+                c.on_clipboard_text(text);
+            }
+            state
+        }
+        0x03 => handle_viewer_file_list(&data[1..]),
+        0x04 => handle_viewer_file_chunk(&data[1..], state),
+        0x05 => {
+            if let Some(s) = state {
+                handle_viewer_transfer_complete(s, callback);
+            }
+            None
+        }
+        _ => {
+            warn!("[Viewer] Unknown clipboard msg type: 0x{:02X}", data[0]);
+            state
+        }
+    }
+}
+
+fn handle_viewer_file_list(data: &[u8]) -> Option<ClipViewerState> {
+    if data.len() < 2 {
+        return None;
+    }
+    let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let mut offset = 2usize;
+    let mut files: Vec<(std::path::PathBuf, std::fs::File, u64)> = Vec::new();
+
+    let dir = std::env::temp_dir().join("rtcdesk-clipboard");
+    let _ = std::fs::create_dir_all(&dir);
+
+    for _ in 0..count {
+        if offset + 2 > data.len() {
+            break;
+        }
+        let name_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if offset + name_len > data.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&data[offset..offset + name_len]).to_string();
+        offset += name_len;
+        if offset + 8 > data.len() {
+            break;
+        }
+        let size = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap_or_default());
+        offset += 8;
+
+        let fname = std::path::PathBuf::from(&name)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("file_{}", files.len()));
+        let path = dir.join(&fname);
+
+        match std::fs::File::create(&path) {
+            Ok(f) => files.push((path, f, size)),
+            Err(e) => error!("[Viewer] Cannot create file {}: {}", fname, e),
+        }
+    }
+
+    if files.is_empty() {
+        None
+    } else {
+        Some(ClipViewerState { files, dir })
+    }
+}
+
+fn handle_viewer_file_chunk(
+    data: &[u8],
+    state: Option<ClipViewerState>,
+) -> Option<ClipViewerState> {
+    let mut s = state?;
+    let mut offset = 0usize;
+    while offset + 14 <= data.len() {
+        let idx = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        let off = u64::from_le_bytes(data[offset + 2..offset + 10].try_into().unwrap_or_default());
+        let len = u32::from_le_bytes(
+            data[offset + 10..offset + 14]
+                .try_into()
+                .unwrap_or_default(),
+        ) as usize;
+        let header_end = offset + 14;
+        if data.len() < header_end + len {
+            break;
+        }
+        let chunk_data = &data[header_end..header_end + len];
+        if idx < s.files.len() {
+            let file = &mut s.files[idx].1;
+            if let Err(e) = file.seek(SeekFrom::Start(off)) {
+                error!("[Viewer] Seek error: {}", e);
+            } else if let Err(e) = file.write_all(chunk_data) {
+                error!("[Viewer] Write error: {}", e);
+            }
+        }
+        offset = header_end + len;
+    }
+    Some(s)
+}
+
+fn handle_viewer_transfer_complete(s: ClipViewerState, callback: &Option<Arc<dyn ViewerCallback>>) {
+    let file_count = s.files.len();
+    let dir_display = s.dir.display().to_string();
+    let uris: Vec<String> = s
+        .files
+        .iter()
+        .map(|(path, _, _)| format!("file://{}", path.display()))
+        .collect();
+    info!(
+        "[Viewer] Host clipboard files received: {} files in {}",
+        file_count, dir_display
+    );
+    // File handles are dropped automatically when s goes out of scope.
+    drop(s);
+    if let Some(c) = callback {
+        c.on_clipboard_file_uris(uris.join("\n"));
+    }
+}
+
+fn spawn_ice_forwarder(
+    mut ice_rx: tokio::sync::mpsc::UnboundedReceiver<SignalMessage>,
+    host_id: String,
+    ws_write: Arc<Mutex<Option<WsSplitSink>>>,
+) {
+    use futures_util::SinkExt;
+    tokio::spawn(async move {
+        while let Some(mut msg) = ice_rx.recv().await {
+            if let SignalMessage::IceCandidate { to, .. } = &mut msg {
+                *to = host_id.clone();
+            }
+            let json = serde_json::to_string(&msg).unwrap();
+            let mut ws = ws_write.lock().await;
+            if let Some(ref mut w) = *ws {
+                let _ = w
+                    .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
+                    .await;
+            }
+        }
+    });
+}
+
+fn spawn_signaling_reader(
+    mut ws_read: futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+    callback: Option<Arc<dyn ViewerCallback>>,
+    ws_write: Arc<Mutex<Option<WsSplitSink>>>,
+    pc: Option<Arc<dyn PeerConnection>>,
+    viewer_id: String,
+    host_id: String,
+    connected: Arc<AtomicBool>,
+    ws_disconnected: Arc<Notify>,
+    v_params: signal::CapturerParams,
+) {
+    use futures_util::StreamExt;
+    tokio::spawn(async move {
+        info!("[{}] Signaling reader started", viewer_id);
+        while let Some(msg) = ws_read.next().await {
+            if dispatch_viewer_signal(
+                msg,
+                &callback,
+                &ws_write,
+                &pc,
+                &viewer_id,
+                &host_id,
+                &connected,
+                &ws_disconnected,
+                &v_params,
+            )
+            .await
+            {
+                return;
+            }
+        }
+        connected.store(false, Ordering::SeqCst);
+        ws_disconnected.notify_one();
+    });
+}
+
+async fn dispatch_viewer_signal(
+    msg: Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    callback: &Option<Arc<dyn ViewerCallback>>,
+    ws_write: &Arc<Mutex<Option<WsSplitSink>>>,
+    pc: &Option<Arc<dyn PeerConnection>>,
+    viewer_id: &str,
+    host_id: &str,
+    connected: &Arc<AtomicBool>,
+    ws_disconnected: &Arc<Notify>,
+    v_params: &signal::CapturerParams,
+) -> bool {
+    use tokio_tungstenite::tungstenite::Message as TM;
+    match msg {
+        Ok(TM::Text(text)) => {
+            let sm: SignalMessage = match serde_json::from_str(&text) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Bad msg: {}", e);
+                    return false;
+                }
+            };
+            info!("[{}] Recv: {:?}", viewer_id, sm);
+            handle_offer(
+                sm,
+                callback,
+                ws_write,
+                pc,
+                viewer_id,
+                host_id,
+                connected,
+                ws_disconnected,
+                v_params,
+            )
+            .await
+        }
+        Ok(TM::Close(_)) | Err(_) => {
+            connected.store(false, Ordering::SeqCst);
+            ws_disconnected.notify_one();
+            if let Some(c) = callback {
+                c.on_disconnected();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn handle_offer(
+    sm: SignalMessage,
+    callback: &Option<Arc<dyn ViewerCallback>>,
+    ws_write: &Arc<Mutex<Option<WsSplitSink>>>,
+    pc: &Option<Arc<dyn PeerConnection>>,
+    viewer_id: &str,
+    host_id: &str,
+    connected: &Arc<AtomicBool>,
+    ws_disconnected: &Arc<Notify>,
+    v_params: &signal::CapturerParams,
+) -> bool {
+    match sm {
+        SignalMessage::Registered { .. } => {
+            if let Some(c) = callback {
+                c.on_connection_state("registered".into());
+            }
+        }
+        SignalMessage::Offer { sdp, .. } => {
+            info!("[{}] Offer received", viewer_id);
+            process_offer(sdp, callback, ws_write, pc, viewer_id, host_id, v_params).await;
+        }
+        SignalMessage::IceCandidate {
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+            ..
+        } => {
+            if let Some(pc) = pc {
+                let _ = pc
+                    .add_ice_candidate(webrtc::peer_connection::RTCIceCandidateInit {
+                        candidate,
+                        sdp_mid,
+                        sdp_mline_index,
+                        username_fragment: None,
+                        url: None,
+                    })
+                    .await;
+            }
+        }
+        SignalMessage::PeerLeft { id } if id == *host_id => {
+            connected.store(false, Ordering::SeqCst);
+            ws_disconnected.notify_one();
+            if let Some(c) = callback {
+                c.on_disconnected();
+            }
+            return true;
+        }
+        SignalMessage::Error { message } => {
+            if let Some(c) = callback {
+                c.on_error(message);
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn process_offer(
+    sdp: String,
+    callback: &Option<Arc<dyn ViewerCallback>>,
+    ws_write: &Arc<Mutex<Option<WsSplitSink>>>,
+    pc: &Option<Arc<dyn PeerConnection>>,
+    viewer_id: &str,
+    host_id: &str,
+    v_params: &signal::CapturerParams,
+) {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as TM;
+    let Some(pc) = pc else { return };
+    let desc = match RTCSessionDescription::offer(sdp) {
+        Ok(d) => d,
+        Err(e) => {
+            error!("offer: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = pc.set_remote_description(desc).await {
+        error!("set_remote: {}", e);
+        return;
+    }
+    match pc.create_answer(None).await {
+        Ok(answer) => {
+            let _ = pc.set_local_description(answer.clone()).await;
+            let sdp_with_params = format!(
+                "{}\n{}",
+                answer.sdp,
+                signal::encode_capturer_params_to_sdp(v_params),
+            );
+            info!(
+                "[{}] Injecting capturer params into Answer SDP: quality={:?} max_dim={:?} fps={:?}",
+                viewer_id, v_params.pic_quality, v_params.max_dimension, v_params.fps
+            );
+            let am = SignalMessage::Answer {
+                from: viewer_id.to_string(),
+                to: host_id.to_string(),
+                sdp: sdp_with_params,
+            };
+            let json = serde_json::to_string(&am).unwrap();
+            let mut ws = ws_write.lock().await;
+            if let Some(ref mut w) = *ws {
+                let _ = w.send(TM::Text(json.into())).await;
+            }
+            info!("[{}] Answer sent", viewer_id);
+            if let Some(c) = callback {
+                c.on_connected();
+            }
+        }
+        Err(e) => error!("create_answer: {}", e),
+    }
+}
+
+#[derive(Clone)]
+struct SignalingEventHandler {
+    ice_tx: tokio::sync::mpsc::UnboundedSender<SignalMessage>,
+    dc_tx: tokio::sync::mpsc::UnboundedSender<Arc<dyn DataChannel>>,
+    peer_id: String,
+}
+
+impl SignalingEventHandler {
+    fn new(
+        ice_tx: tokio::sync::mpsc::UnboundedSender<SignalMessage>,
+        dc_tx: tokio::sync::mpsc::UnboundedSender<Arc<dyn DataChannel>>,
+        peer_id: String,
+    ) -> Self {
+        Self {
+            ice_tx,
+            dc_tx,
+            peer_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for SignalingEventHandler {
+    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+        if let Ok(init) = event.candidate.to_json() {
+            if init.candidate.is_empty() {
+                return;
+            }
+            info!("[{}] ICE candidate generated", self.peer_id);
+            let msg = SignalMessage::IceCandidate {
+                from: self.peer_id.clone(),
+                to: String::new(),
+                candidate: init.candidate,
+                sdp_mid: init.sdp_mid,
+                sdp_mline_index: init.sdp_mline_index,
+            };
+            let _ = self.ice_tx.send(msg);
+        }
+    }
+    async fn on_ice_connection_state_change(&self, s: RTCIceConnectionState) {
+        info!("[{}] ICE: {:?}", self.peer_id, s);
+    }
+    async fn on_connection_state_change(&self, s: RTCPeerConnectionState) {
+        info!("[{}] Conn: {:?}", self.peer_id, s);
+    }
+    async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
+        let label = dc.label().await.unwrap_or_default();
+        info!("[{}] Remote DC '{}'", self.peer_id, label);
+        let _ = self.dc_tx.send(dc);
+    }
+}
+
+fn build_configuration(stun: &[String]) -> RTCConfiguration {
+    let servers: Vec<RTCIceServer> = if stun.is_empty() {
+        vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".into()],
+            ..Default::default()
+        }]
+    } else {
+        stun.iter()
+            .map(|u| RTCIceServer {
+                urls: vec![u.clone()],
+                ..Default::default()
+            })
+            .collect()
+    };
+    RTCConfigurationBuilder::new()
+        .with_ice_servers(servers)
+        .build()
+}
