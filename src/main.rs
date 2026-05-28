@@ -49,7 +49,7 @@ const DEFAULT_BIND_ADDR: &str = "0.0.0.0:9009";
 /// Comma-separated STUN server URLs (e.g. "stun:your-server:3478,stun:backup:3478").
 /// Leave empty for LAN-only (no NAT traversal). Set via `RTCDESK_STUN` env var.
 const DEFAULT_STUN: &str = "";
-const DEFAULT_FPS: u32 = 15;
+const LOCAL_DEFAULT_FPS: u32 = frame::DEFAULT_FPS;
 
 /// Holds the initialized host state.
 struct HostContext {
@@ -88,7 +88,7 @@ async fn init_host() -> Result<HostContext> {
             error!("Signaling server error: {}", e);
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(frame::SIGNAL_STARTUP_DELAY_MS)).await;
 
     // Connect to own signaling server as host.
     // 0.0.0.0 is only valid for listening, not connecting — use 127.0.0.1.
@@ -119,7 +119,7 @@ async fn init_host() -> Result<HostContext> {
         .map(|c| {
             let (w, h) = c.resolution();
             info!("Screen capturer: {}x{}", w, h);
-            c.set_max_dimension(1280);
+            c.set_max_dimension(frame::DEFAULT_CAPTURE_DIM);
             Arc::new(c)
         })
         .map_err(|e| warn!("Screen capturer init failed: {}", e))
@@ -150,9 +150,9 @@ async fn init_host() -> Result<HostContext> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let fps: u32 = std::env::var("RTCDESK_FPS")
-        .unwrap_or_else(|_| DEFAULT_FPS.to_string())
+        .unwrap_or_else(|_| LOCAL_DEFAULT_FPS.to_string())
         .parse()
-        .unwrap_or(DEFAULT_FPS);
+        .unwrap_or(LOCAL_DEFAULT_FPS);
 
     let ctx = init_host().await?;
     let HostContext {
@@ -200,8 +200,12 @@ async fn run_host_loop(
                     }
                 };
                 info!("Host recv: {:?}", msg);
-                dispatch_host_message(msg, host_id, ws_write, stun, capturer, fps, sessions)
-                    .await?;
+                if let Err(e) = dispatch_host_message(msg, host_id, ws_write, stun, capturer, fps, sessions)
+                    .await
+                {
+                    error!("Failed to handle signaling message from {}: {}", host_id, e);
+                    // Don't crash the whole server because of one failed message
+                }
             }
             Ok(Message::Close(_)) => {
                 info!("Signaling closed");
@@ -289,20 +293,13 @@ async fn dispatch_host_message(
     Ok(())
 }
 
-async fn handle_connect(
-    host_id: &str,
-    viewer_id: &str,
+/// Spawn a task that forwards ICE candidates from the peer to the viewer
+/// via the shared WebSocket signaling channel.
+fn spawn_ice_forwarder(
+    peer: &mut RtcPeer,
     ws: &Arc<SharedWs>,
-    stun: &[String],
-    capturer: Option<&Arc<ScreenCapturer>>,
-    _fps: u32,
-    sessions: &Arc<tokio::sync::Mutex<Vec<(String, Arc<RtcPeer>)>>>,
+    viewer_id: &str,
 ) -> Result<()> {
-    let mut peer = RtcPeer::new_host(host_id, stun).await?;
-
-    // ===== ICE candidate forwarding =====
-    // Without this, the host's ICE candidates are generated but never
-    // forwarded to the viewer → ICE never reaches Connected → no streaming.
     let mut ice_rx = peer
         .take_ice_receiver()
         .context("ICE receiver already taken")?;
@@ -318,6 +315,40 @@ async fn handle_connect(
             let _ = w.send(Message::Text(json.into())).await;
         }
     });
+    Ok(())
+}
+
+/// Create the "input" and "clipboard" data channels for a viewer session
+/// and spawn the corresponding reader/writer tasks.
+async fn setup_input_and_clipboard(
+    peer: &Arc<RtcPeer>,
+    viewer_id: &str,
+) -> Result<()> {
+    let input_dc = peer.create_frame_channel("input").await?;
+    let running = peer.running_flag();
+    let input_peer_id = viewer_id.to_string();
+    crate::peer::spawn_input_reader(input_dc, running.clone(), input_peer_id);
+
+    let clipboard_dc = peer.create_frame_channel("clipboard").await?;
+    let clip_peer_id = viewer_id.to_string();
+    let clip_dc_writer = clipboard_dc.clone();
+    crate::peer::spawn_clipboard_reader(clipboard_dc, running.clone(), clip_peer_id.clone());
+    crate::peer::spawn_clipboard_writer(clip_dc_writer, running, clip_peer_id);
+    Ok(())
+}
+
+async fn handle_connect(
+    host_id: &str,
+    viewer_id: &str,
+    ws: &Arc<SharedWs>,
+    stun: &[String],
+    capturer: Option<&Arc<ScreenCapturer>>,
+    _fps: u32,
+    sessions: &Arc<tokio::sync::Mutex<Vec<(String, Arc<RtcPeer>)>>>,
+) -> Result<()> {
+    let mut peer = RtcPeer::new_host(host_id, stun).await?;
+
+    spawn_ice_forwarder(&mut peer, ws, viewer_id)?;
 
     if let Some(c) = capturer {
         peer.attach_capturer(c.clone())?;
@@ -328,20 +359,8 @@ async fn handle_connect(
     let dc = peer.create_frame_channel("desktop").await?;
     peer.set_frame_channel(dc);
 
-    // Also create the "input" channel so the viewer can send mouse/key events
-    let input_dc = peer.create_frame_channel("input").await?;
-    let running = peer.running_flag();
-    let input_peer_id = viewer_id.to_string();
-    peer::spawn_input_reader(input_dc, running.clone(), input_peer_id);
-
-    // Create "clipboard" channel for file/text clipboard sync (viewer → host)
-    let clipboard_dc = peer.create_frame_channel("clipboard").await?;
-    let clip_peer_id = viewer_id.to_string();
-    let clip_dc_writer = clipboard_dc.clone();
-    peer::spawn_clipboard_reader(clipboard_dc, running.clone(), clip_peer_id.clone());
-    peer::spawn_clipboard_writer(clip_dc_writer, running, clip_peer_id);
-
     let peer = Arc::new(peer);
+    setup_input_and_clipboard(&peer, viewer_id).await?;
 
     // Create offer
     let offer = peer.create_offer().await?;
@@ -389,41 +408,14 @@ async fn handle_remote_offer(
         host_id
     );
 
-    // ICE candidate forwarding
-    let mut ice_rx = peer
-        .take_ice_receiver()
-        .context("ICE receiver already taken")?;
-    let ice_ws = ws.clone();
-    let ice_viewer_id = viewer_id.to_string();
-    tokio::spawn(async move {
-        while let Some(mut msg) = ice_rx.recv().await {
-            if let SignalMessage::IceCandidate { to, .. } = &mut msg {
-                *to = ice_viewer_id.clone();
-            }
-            let json = serde_json::to_string(&msg).unwrap_or_default();
-            let mut w = ice_ws.lock().await;
-            let _ = w.send(Message::Text(json.into())).await;
-        }
-    });
+    spawn_ice_forwarder(&mut peer, ws, viewer_id)?;
 
     let peer = Arc::new(peer);
 
     peer.set_remote_description(sdp_str, RTCSdpType::Offer)
         .await?;
 
-    // Create the "input" data channel before creating the answer
-    // so the viewer can send mouse/key events to this host.
-    let input_dc = peer.create_frame_channel("input").await?;
-    let running = peer.running_flag();
-    let input_peer_id = viewer_id.to_string();
-    peer::spawn_input_reader(input_dc, running.clone(), input_peer_id);
-
-    // Create "clipboard" channel for file/text clipboard sync
-    let clipboard_dc = peer.create_frame_channel("clipboard").await?;
-    let clip_peer_id = viewer_id.to_string();
-    let clip_dc_writer = clipboard_dc.clone();
-    peer::spawn_clipboard_reader(clipboard_dc, running.clone(), clip_peer_id.clone());
-    peer::spawn_clipboard_writer(clip_dc_writer, running, clip_peer_id);
+    setup_input_and_clipboard(&peer, viewer_id).await?;
 
     let answer = peer.create_answer().await?;
 

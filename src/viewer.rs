@@ -16,6 +16,7 @@ use webrtc::peer_connection::{
     RTCConfigurationBuilder, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
     RTCPeerConnectionState, RTCSessionDescription,
 };
+use crate::frame;
 
 pub trait ViewerCallback: Send + Sync {
     fn on_connected(&self);
@@ -74,10 +75,10 @@ impl RtcViewer {
             input_channel: Arc::new(Mutex::new(None)),
             clipboard_channel: Arc::new(Mutex::new(None)),
             ws_disconnected: Arc::new(Notify::new()),
-            pic_quality: 30,
-            fps: 30,
-            width: 1280,
-            height: 720,
+            pic_quality: frame::DEFAULT_JPEG_QUALITY as u32,
+            fps: frame::DEFAULT_FPS * 2,
+            width: frame::DEFAULT_FRAME_W,
+            height: frame::DEFAULT_FRAME_H,
             bitrate: None,
         }
     }
@@ -167,8 +168,8 @@ impl RtcViewer {
     pub async fn send_mouse_event(&self, x: f64, y: f64, button: u8, pressed: bool) -> Result<()> {
         let ch = self.input_channel.lock().await;
         if let Some(ref dc) = *ch {
-            let mut payload = Vec::with_capacity(19);
-            payload.push(0x01);
+            let mut payload = Vec::with_capacity(frame::MOUSE_EVENT_SIZE);
+            payload.push(frame::TAG_MOUSE);
             payload.extend_from_slice(&x.to_le_bytes());
             payload.extend_from_slice(&y.to_le_bytes());
             payload.push(button);
@@ -183,7 +184,7 @@ impl RtcViewer {
     pub async fn send_key_event(&self, key_code: u32, pressed: bool) -> Result<()> {
         let ch = self.input_channel.lock().await;
         if let Some(ref dc) = *ch {
-            let mut payload = vec![0x02u8];
+            let mut payload = vec![frame::TAG_KEY];
             payload.extend_from_slice(&key_code.to_le_bytes());
             payload.push(if pressed { 1 } else { 0 });
             dc.send(BytesMut::from(&payload[..]))
@@ -220,22 +221,23 @@ impl RtcViewer {
 
             // Split the flat chunks blob into individual chunk messages.
             // Format per chunk: [0x04][file_index:u16le][offset:u64le][len:u32le][data]
+            let msg_sz = frame::CLIP_CHUNK_MSG_SIZE;
             let mut offset = 0usize;
-            while offset + 15 <= chunks.len() {
-                if chunks[offset] != 0x04 {
+            while offset + msg_sz <= chunks.len() {
+                if chunks[offset] != frame::CLIP_TAG_FILE_CHUNK {
                     warn!(
-                        "Expected 0x04 chunk marker at offset {}, got 0x{:02X}",
+                        "[Viewer] Expected chunk marker at offset {}, got 0x{:02X}",
                         offset, chunks[offset]
                     );
                     offset += 1;
                     continue;
                 }
                 let data_len = u32::from_le_bytes(
-                    chunks[offset + 11..offset + 15]
+                    chunks[offset + 11..offset + msg_sz]
                         .try_into()
                         .unwrap_or([0; 4]),
                 ) as usize;
-                let total = 15 + data_len;
+                let total = msg_sz + data_len;
                 if offset + total > chunks.len() {
                     warn!("Chunk truncated at offset {}", offset);
                     break;
@@ -247,7 +249,7 @@ impl RtcViewer {
             }
 
             // Send complete marker
-            dc.send(BytesMut::from(&[0x05u8][..]))
+            dc.send(BytesMut::from(&[frame::CLIP_TAG_DONE][..]))
                 .await
                 .map_err(|e| anyhow::anyhow!("file_complete: {}", e))?;
         }
@@ -380,17 +382,17 @@ async fn assemble_desktop_frames(
         match dc.poll().await {
             Some(DataChannelEvent::OnMessage(msg)) => {
                 if let Some(merged) = assembler.push(&msg.data) {
-                    if merged.len() >= 8 {
+                    if merged.len() >= frame::FRAME_HDR_SIZE {
                         let w = u32::from_be_bytes([merged[0], merged[1], merged[2], merged[3]]);
                         let h = u32::from_be_bytes([merged[4], merged[5], merged[6], merged[7]]);
                         if let Some(ref c) = callback {
-                            c.on_frame(merged[8..].to_vec(), w, h);
+                            c.on_frame(merged[frame::FRAME_HDR_SIZE..].to_vec(), w, h);
                         }
                     }
                 }
             }
             Some(DataChannelEvent::OnClose) | Some(DataChannelEvent::OnError) => break,
-            None => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            None => tokio::time::sleep(std::time::Duration::from_millis(frame::VIEWER_FRAME_POLL_MS)).await,
             _ => {}
         }
     }
@@ -422,7 +424,7 @@ async fn viewer_clipboard_reader(
                 break;
             }
             None => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(frame::CLIPBOARD_POLL_MS)).await;
             }
             _ => {}
         }
@@ -436,7 +438,7 @@ fn handle_viewer_clipboard_msg(
     callback: &Option<Arc<dyn ViewerCallback>>,
 ) -> Option<ClipViewerState> {
     match data[0] {
-        0x01 => {
+        frame::CLIP_TAG_TEXT => {
             // Text clipboard from host
             let text = String::from_utf8_lossy(&data[1..]).to_string();
             if let Some(c) = callback {
@@ -444,9 +446,9 @@ fn handle_viewer_clipboard_msg(
             }
             state
         }
-        0x03 => handle_viewer_file_list(&data[1..]),
-        0x04 => handle_viewer_file_chunk(&data[1..], state),
-        0x05 => {
+        frame::CLIP_TAG_FILE_LIST => handle_viewer_file_list(&data[1..]),
+        frame::CLIP_TAG_FILE_CHUNK => handle_viewer_file_chunk(&data[1..], state),
+        frame::CLIP_TAG_DONE => {
             if let Some(s) = state {
                 handle_viewer_transfer_complete(s, callback);
             }
@@ -832,7 +834,7 @@ impl PeerConnectionEventHandler for SignalingEventHandler {
 fn build_configuration(stun: &[String]) -> RTCConfiguration {
     let servers: Vec<RTCIceServer> = if stun.is_empty() {
         vec![RTCIceServer {
-            urls: vec!["stun:stun.l.google.com:19302".into()],
+            urls: vec![frame::DEFAULT_STUN.into()],
             ..Default::default()
         }]
     } else {

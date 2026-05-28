@@ -1,11 +1,10 @@
 [package]
-name = "rtcsdk"
+name = "rtcdesk"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 webrtc = "=0.20.0-alpha.1"
-uniffi = { version = "0.29", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "__rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "std"] }
@@ -26,13 +25,16 @@ stunclient = { version = "0.4", features = ["async"] }
 local-ip-address = "0.6"
 enigo = "0.6"
 arboard = "3"
-dioxus="0.7"
+dioxus-html = "0.7"
+keyboard-types = "0.7"
+base64 = "0.22"
+dioxus = { version = "0.7", features = [] }
 
-
-
-[lib]
-crate-type = ["cdylib", "staticlib"]
-path = "src/lib.rs"
+[features]
+default = ["desktop"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]
 
 [[bin]]
 name = "rtcdesk"
@@ -46,14 +48,3 @@ path = "src/client.rs"
 name = "stuncheck"
 path = "src/stuncheck.rs"
 
-[build-dependencies]
-uniffi = { version = "0.29", features = ["build"] }
-
-[dev-dependencies]
-uniffi = { version = "0.29", features = ["bindgen-tests"] }
-
-[uniffi]
-async_runtime = "tokio"
-
-[features]
-ffi-trace = ["uniffi/ffi-trace"]

@@ -6,7 +6,6 @@
 //! Uses webrtc-rs 0.20 alpha API with sans-IO architecture.
 
 use crate::capture::ScreenCapturer;
-use crate::frame;
 use crate::signal::{self, SignalMessage};
 use anyhow::{Context, Result};
 use bytes::BytesMut;
@@ -23,6 +22,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
+
+// ── Key code constants ─────────────────────────────────────────────────────
+// (Mirrored from frame.rs for local use; shared VK codes are frame::VK_*.)
+use crate::frame::{
+    self, VK_ALT, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
+};
+const ASCII_PRINTABLE_MIN: u32 = 0x21;
+const ASCII_PRINTABLE_MAX: u32 = 0x7E;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration,
     RTCConfigurationBuilder, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
@@ -173,9 +181,8 @@ pub struct RtcPeer {
 impl RtcPeer {
     /// Send a mouse input event.
     pub async fn send_mouse_event(&self, x: f64, y: f64, button: u8, pressed: bool) -> Result<()> {
-        // Create mouse event payload
-        let mut payload = Vec::with_capacity(19);
-        payload.push(0x01); // Mouse event type
+        let mut payload = Vec::with_capacity(frame::MOUSE_EVENT_SIZE);
+        payload.push(frame::TAG_MOUSE);
         payload.extend_from_slice(&x.to_le_bytes());
         payload.extend_from_slice(&y.to_le_bytes());
         payload.push(button);
@@ -193,9 +200,8 @@ impl RtcPeer {
 
     /// Send a keyboard input event.
     pub async fn send_key_event(&self, key_code: u32, pressed: bool) -> Result<()> {
-        // Create key event payload
-        let mut payload = Vec::with_capacity(5);
-        payload.push(0x02); // Key event type
+        let mut payload = Vec::with_capacity(frame::KEY_EVENT_SIZE);
+        payload.push(frame::TAG_KEY);
         payload.extend_from_slice(&key_code.to_le_bytes());
         payload.push(if pressed { 1 } else { 0 });
 
@@ -456,7 +462,7 @@ impl RtcPeer {
                         break;
                     }
                     None => {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(frame::DC_OPEN_POLL_MS)).await;
                     }
                     _ => {
                         // Drain OnBufferedAmountLow and other events.
@@ -476,12 +482,12 @@ impl RtcPeer {
             .context("no capturer attached")?
             .clone();
 
-        // Wait for ICE connection to be established (with 30s timeout)
+        // Wait for ICE connection to be established (with timeout)
         tokio::select! {
             _ = self.connection_ready.notified() => {
                 info!("[{}] ICE connection established, starting stream", self.peer_id);
             }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            _ = tokio::time::sleep(Duration::from_secs(frame::ICE_TIMEOUT_SECS)) => {
                 warn!("[{}] Timed out waiting for ICE connection, starting anyway", self.peer_id);
             }
         }
@@ -504,7 +510,7 @@ impl RtcPeer {
                 _ = self.dc_ready.notified() => {
                     info!("[{}] Data channel open, ready to stream", self.peer_id);
                 }
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                _ = tokio::time::sleep(Duration::from_secs(frame::DC_OPEN_TIMEOUT_SECS)) => {
                     warn!("[{}] Timed out waiting for data channel to open, streaming anyway", self.peer_id);
                 }
             }
@@ -568,7 +574,7 @@ async fn run_stream_loop(
         };
 
         let fid = frame_counter.fetch_add(1, Ordering::Relaxed);
-        let mut payload = Vec::with_capacity(8 + frame.data.len());
+        let mut payload = Vec::with_capacity(frame::FRAME_HDR_SIZE + frame.data.len());
         payload.extend_from_slice(&frame.width.to_be_bytes());
         payload.extend_from_slice(&frame.height.to_be_bytes());
         payload.extend_from_slice(&frame.data);
@@ -585,7 +591,7 @@ async fn run_stream_loop(
                     break;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(Duration::from_millis(frame::INTER_CHUNK_DELAY_MS)).await;
         }
         if !send_ok {
             break;
@@ -631,7 +637,7 @@ pub fn spawn_input_reader(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>, pe
                     break;
                 }
                 None => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(frame::INPUT_POLL_MS)).await;
                 }
                 _ => {}
             }
@@ -647,34 +653,35 @@ fn dispatch_input(data: &[u8], peer_id: &str) {
     }
     let tag = data[0];
     info!(
-        "[{}] dispatch_input: tag=0x{:02X} len={} raw=[{}]",
-        peer_id,
-        tag,
-        data.len(),
-        data.iter()
-            .take(20)
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ")
+        "[{}] dispatch_input: tag=0x{:02X} len={}",
+        peer_id, tag, data.len()
     );
     match tag {
-        0x01 => dispatch_mouse(data, peer_id),
-        0x02 => dispatch_key(data, peer_id),
+        frame::TAG_MOUSE => dispatch_mouse(data, peer_id),
+        frame::TAG_KEY => dispatch_key(data, peer_id),
         _ => warn!("[{}] Unknown input event type: 0x{:02X}", peer_id, data[0]),
     }
 }
 
-/// Parse a mouse event (19 bytes) and simulate it via `enigo`.
+/// Parse a mouse event and simulate it via `enigo`.
 /// Format: `[0x01][x:f64le][y:f64le][button:u8][pressed:u8]`
 fn dispatch_mouse(data: &[u8], peer_id: &str) {
-    if data.len() < 19 {
+    if data.len() < frame::MOUSE_EVENT_SIZE {
         warn!("[{}] Mouse event too short: {} bytes", peer_id, data.len());
         return;
     }
-    let x = f64::from_le_bytes(data[1..9].try_into().unwrap());
-    let y = f64::from_le_bytes(data[9..17].try_into().unwrap());
-    let button = data[17];
-    let pressed = data[18] == 1;
+    let x = f64::from_le_bytes(
+        data[frame::MOUSE_X_OFF..frame::MOUSE_Y_OFF]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    let y = f64::from_le_bytes(
+        data[frame::MOUSE_Y_OFF..frame::MOUSE_BTN_OFF]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    let button = data[frame::MOUSE_BTN_OFF];
+    let pressed = data[frame::MOUSE_PRESSED_OFF] == 1;
 
     info!(
         "[{}] Mouse: ({:.0}, {:.0}) btn={} {}",
@@ -692,9 +699,10 @@ fn dispatch_mouse(data: &[u8], peer_id: &str) {
 
             // Map button code to enigo Button
             let btn = match button {
-                0 => Button::Left,
-                1 => Button::Middle,
-                2 => Button::Right,
+                frame::BTN_LEFT => Button::Left,
+                frame::BTN_MIDDLE => Button::Middle,
+                frame::BTN_RIGHT => Button::Right,
+                frame::BTN_MOVE => return, // mouse-move only, no button action
                 _ => {
                     warn!("[{}] Unknown mouse button: {}", peer_id, button);
                     return;
@@ -714,15 +722,19 @@ fn dispatch_mouse(data: &[u8], peer_id: &str) {
     }
 }
 
-/// Parse a key event (6+ bytes) and simulate it via `enigo`.
+/// Parse a key event and simulate it via `enigo`.
 /// Format: `[0x02][key_code:u32le][pressed:u8]`
 fn dispatch_key(data: &[u8], peer_id: &str) {
-    if data.len() < 6 {
+    if data.len() < frame::KEY_EVENT_SIZE {
         warn!("[{}] Key event too short: {} bytes", peer_id, data.len());
         return;
     }
-    let key_code = u32::from_le_bytes(data[1..5].try_into().unwrap());
-    let pressed = data[5] == 1;
+    let key_code = u32::from_le_bytes(
+        data[frame::KEY_CODE_OFF..frame::KEY_PRESSED_OFF]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    let pressed = data[frame::KEY_PRESSED_OFF] == 1;
 
     let raw_bytes: Vec<String> = data.iter().map(|b| format!("{:02X}", b)).collect();
     info!(
@@ -735,7 +747,7 @@ fn dispatch_key(data: &[u8], peer_id: &str) {
     );
 
     // ── Ctrl state tracking ───────────────────────────────────────────
-    if key_code == 0x11 {
+    if key_code == VK_CONTROL {
         CTRL_HELD.store(pressed, Ordering::Relaxed);
     }
 
@@ -746,7 +758,7 @@ fn dispatch_key(data: &[u8], peer_id: &str) {
     // On Windows, `SendInput` with `KEYEVENTF_UNICODE` handles modifier
     // combinations correctly, so we let the normal enigo path handle it.
     #[cfg(target_os = "linux")]
-    if pressed && key_code == 0x76 /* 'v' */ && CTRL_HELD.load(Ordering::Relaxed) {
+    if pressed && key_code == VK_V && CTRL_HELD.load(Ordering::Relaxed) {
         info!(
             "[{}] Ctrl+V detected – delegating to xclip + xdotool",
             peer_id
@@ -787,27 +799,24 @@ fn dispatch_key(data: &[u8], peer_id: &str) {
 /// well-known scan-code-ish values.
 fn map_key_code(code: u32) -> Key {
     match code {
-        // ── Modifier keys (pseudo VK codes, see composeKeyToUnicode) ──
-        0x10 => Key::Shift,   // VK_SHIFT
-        0x11 => Key::Control, // VK_CONTROL
-        0x12 => Key::Alt,     // VK_MENU
+        VK_SHIFT => Key::Shift,
+        VK_CONTROL => Key::Control,
+        VK_ALT => Key::Alt,
 
-        // ── Named keys (unique codes, no conflict with letters) ─────
-        0x08 => Key::Backspace,
-        0x09 => Key::Tab,
-        0x0D => Key::Return,
-        0x1B => Key::Escape,
-        0x20 => Key::Space,
-        0x25 => Key::LeftArrow,
-        0x26 => Key::UpArrow,
-        0x27 => Key::RightArrow,
-        0x28 => Key::DownArrow,
-        0x7F => Key::Delete,
+        VK_BACK => Key::Backspace,
+        VK_TAB => Key::Tab,
+        VK_RETURN => Key::Return,
+        VK_ESCAPE => Key::Escape,
+        VK_SPACE => Key::Space,
+        VK_LEFT => Key::LeftArrow,
+        VK_UP => Key::UpArrow,
+        VK_RIGHT => Key::RightArrow,
+        VK_DOWN => Key::DownArrow,
+        VK_DELETE => Key::Delete,
 
-        // ── ASCII printable ───────────────────────────────────────────
-        c if (0x21..=0x7E).contains(&c) => Key::Unicode(char::from_u32(c).unwrap_or('?')),
+        c if (ASCII_PRINTABLE_MIN..=ASCII_PRINTABLE_MAX).contains(&c) =>
+            Key::Unicode(char::from_u32(c).unwrap_or('?')),
 
-        // ── Everything else → best-effort Unicode ─────────────────────
         _ => Key::Unicode(char::from_u32(code).unwrap_or('\0')),
     }
 }
@@ -837,7 +846,7 @@ pub fn spawn_clipboard_reader(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>
                     break;
                 }
                 None => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(frame::CLIPBOARD_POLL_MS)).await;
                 }
                 _ => {}
             }
@@ -848,7 +857,7 @@ pub fn spawn_clipboard_reader(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>
 
 fn handle_clipboard_msg(data: &[u8], state: Option<ClipState>, peer_id: &str) -> Option<ClipState> {
     match data[0] {
-        0x01 => {
+        frame::CLIP_TAG_TEXT => {
             // Text clipboard from viewer
             let text = String::from_utf8_lossy(&data[1..]).to_string();
             let hash = text_hash(&text);
@@ -868,9 +877,9 @@ fn handle_clipboard_msg(data: &[u8], state: Option<ClipState>, peer_id: &str) ->
             }
             state
         }
-        0x03 => handle_file_list(&data[1..], peer_id),
-        0x04 => handle_file_chunk(&data[1..], state, peer_id),
-        0x05 => {
+        frame::CLIP_TAG_FILE_LIST => handle_file_list(&data[1..], peer_id),
+        frame::CLIP_TAG_FILE_CHUNK => handle_file_chunk(&data[1..], state, peer_id),
+        frame::CLIP_TAG_DONE => {
             handle_transfer_complete(state, peer_id);
             None
         }
@@ -886,12 +895,12 @@ fn handle_clipboard_msg(data: &[u8], state: Option<ClipState>, peer_id: &str) ->
 
 /// Parse file list: [count:u16le][(name_len:u16le, name:utf8, size:u64le)*]
 fn handle_file_list(data: &[u8], peer_id: &str) -> Option<ClipState> {
-    if data.len() < 2 {
+    if data.len() < frame::CLIP_FILE_LIST_MIN_LEN {
         warn!("[{}] File list too short", peer_id);
         return None;
     }
     let count = u16::from_le_bytes([data[0], data[1]]) as usize;
-    let mut offset = 2usize;
+    let mut offset = frame::CLIP_FILE_LIST_MIN_LEN;
     let mut files: Vec<(PathBuf, File, u64)> = Vec::new();
 
     // Create temp directory for received files
@@ -945,15 +954,14 @@ fn handle_file_list(data: &[u8], peer_id: &str) -> Option<ClipState> {
 fn handle_file_chunk(data: &[u8], state: Option<ClipState>, peer_id: &str) -> Option<ClipState> {
     let mut s = state?;
     let mut offset = 0usize;
-    while offset + 14 <= data.len() {
+    let hdr = frame::CLIP_CHUNK_HDR_SIZE;
+    while offset + hdr <= data.len() {
         let idx = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
         let off = u64::from_le_bytes(data[offset + 2..offset + 10].try_into().unwrap_or_default());
         let len = u32::from_le_bytes(
-            data[offset + 10..offset + 14]
-                .try_into()
-                .unwrap_or_default(),
+            data[offset + 10..offset + hdr].try_into().unwrap_or_default(),
         ) as usize;
-        let header_end = offset + 14;
+        let header_end = offset + hdr;
         if data.len() < header_end + len {
             warn!("[{}] Chunk truncated at offset {}", peer_id, offset);
             break;
@@ -1196,7 +1204,7 @@ pub fn spawn_clipboard_writer(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>
         let mut last_text = String::new();
         let mut last_file_uris = String::new();
         while running.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(frame::CLIPBOARD_WRITE_POLL_MS)).await;
 
             // ── Check text clipboard ─────────────────
             if let Ok(mut c) = arboard::Clipboard::new() {
@@ -1212,7 +1220,7 @@ pub fn spawn_clipboard_writer(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>
                             }
                         };
                         if should_send {
-                            let mut payload = vec![0x01u8];
+                            let mut payload = vec![frame::CLIP_TAG_TEXT];
                             payload.extend_from_slice(text.as_bytes());
                             if dc.send(BytesMut::from(&payload[..])).await.is_ok() {
                                 info!("[{}] Sent clipboard text ({} bytes)", peer_id, text.len());
@@ -1280,7 +1288,7 @@ async fn send_host_clipboard_files(
     peer_id: &str,
     last_file_uris: &mut String,
 ) {
-    let chunk_size = 64 * 1024usize;
+    let chunk_size = frame::FILE_CHUNK_SIZE;
 
     // Parse URIs, strip file:// prefix
     let paths: Vec<std::path::PathBuf> = uris
@@ -1302,8 +1310,8 @@ async fn send_host_clipboard_files(
     }
 
     // Build file list header: [0x03][count:u16le] + for each: [name_len:u16le][name:utf8][size:u64le]
-    let mut list_buf = Vec::with_capacity(256);
-    list_buf.push(0x03);
+    let mut list_buf = Vec::with_capacity(frame::CLIP_FILE_LIST_BUF);
+    list_buf.push(frame::CLIP_TAG_FILE_LIST);
     let count = paths.len() as u16;
     list_buf.extend_from_slice(&count.to_le_bytes());
 
@@ -1336,8 +1344,8 @@ async fn send_host_clipboard_files(
         let mut offset = 0u64;
         while offset < data.len() as u64 {
             let len = std::cmp::min(chunk_size, data.len() - offset as usize);
-            let mut chunk = Vec::with_capacity(15 + len);
-            chunk.push(0x04);
+            let mut chunk = Vec::with_capacity(frame::CLIP_CHUNK_MSG_SIZE + len);
+            chunk.push(frame::CLIP_TAG_FILE_CHUNK);
             chunk.extend_from_slice(&(i as u16).to_le_bytes());
             chunk.extend_from_slice(&offset.to_le_bytes());
             chunk.extend_from_slice(&(len as u32).to_le_bytes());
@@ -1351,7 +1359,7 @@ async fn send_host_clipboard_files(
     }
 
     // Complete marker
-    let _ = dc.send(BytesMut::from(&[0x05u8][..])).await;
+    let _ = dc.send(BytesMut::from(&[frame::CLIP_TAG_DONE][..])).await;
     info!(
         "[{}] Sent {} host clipboard files to viewer",
         peer_id,

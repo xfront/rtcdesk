@@ -5,6 +5,8 @@
 //! JPEG lossy compression keeps frames around 30-60 KB for 720p,
 //! which fits in 2-4 SCTP chunks (vs. ~500 KB for PNG = 34 chunks).
 
+use crate::frame;
+
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageEncoder};
 use log::{debug, info};
@@ -56,8 +58,8 @@ impl ScreenCapturer {
 
         Ok(Self {
             monitor,
-            jpeg_quality: AtomicU8::new(30),
-            max_dimension: AtomicU32::new(1920),
+            jpeg_quality: AtomicU8::new(frame::DEFAULT_JPEG_QUALITY),
+            max_dimension: AtomicU32::new(frame::DEFAULT_MAX_DIMENSION),
         })
     }
 
@@ -163,9 +165,8 @@ impl ScreenCapturer {
 
     /// Returns the monitor resolution.
     pub fn resolution(&self) -> (u32, u32) {
-        (
-            self.monitor.width().unwrap(),
-            self.monitor.height().unwrap(),
-        )
+        let w = self.monitor.width().unwrap_or(1920);
+        let h = self.monitor.height().unwrap_or(1080);
+        (w, h)
     }
 }

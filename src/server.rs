@@ -3,13 +3,14 @@
 //! Handles peer registration, room management, and message forwarding
 //! between hosts and viewers for WebRTC session establishment.
 
+use crate::frame;
 use crate::signal::{PeerRole, SignalMessage};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
-use log::{info, warn};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -37,7 +38,7 @@ pub enum RoomEvent {
 
 impl Default for SignalingState {
     fn default() -> Self {
-        let (tx, _) = broadcast::channel(64);
+        let (tx, _) = broadcast::channel(frame::SIGNAL_BROADCAST_CAP);
         Self {
             peers: RwLock::new(HashMap::new()),
             room_events: tx,
@@ -57,6 +58,7 @@ impl SignalingState {
 
         // Remove existing peer with same ID if any
         if peers.remove(peer_id).is_some() {
+            info!("Removing existing peer with ID: {}", peer_id);
             let _ = self.room_events.send(RoomEvent::PeerLeft {
                 id: peer_id.to_string(),
             });
@@ -68,6 +70,7 @@ impl SignalingState {
         };
         peers.insert(peer_id.to_string(), info);
 
+        info!("Registered new peer: {} as {:?}", peer_id, role);
         let _ = self.room_events.send(RoomEvent::PeerJoined {
             id: peer_id.to_string(),
             role,
@@ -78,6 +81,7 @@ impl SignalingState {
     async fn unregister(&self, peer_id: &str) {
         let mut peers = self.peers.write().await;
         if peers.remove(peer_id).is_some() {
+            info!("Unregistering peer: {}", peer_id);
             let _ = self.room_events.send(RoomEvent::PeerLeft {
                 id: peer_id.to_string(),
             });
@@ -88,8 +92,19 @@ impl SignalingState {
     async fn forward_message(&self, to: &str, message: &str) -> bool {
         let peers = self.peers.read().await;
         if let Some(peer) = peers.get(to) {
-            matches!(peer.sender.send(message.to_string()), Ok(()))
+            info!("Forwarding message to peer {}: {:?}", to, message);
+            match peer.sender.send(message.to_string()) {
+                Ok(()) => {
+                    info!("Message successfully sent to {}", to);
+                    true
+                }
+                Err(e) => {
+                    warn!("Failed to send message to {}: {}", to, e);
+                    false
+                }
+            }
         } else {
+            warn!("Target peer not found: {}", to);
             false
         }
     }
@@ -129,8 +144,19 @@ pub async fn start_signaling_server(
 
     info!("Signaling server listening on {}", bind_addr);
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
+    info!("Binding TCP listener to {}", bind_addr);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await
+        .map_err(|e| {
+            error!("Failed to bind TCP listener: {}", e);
+            e
+        })?;
+    
+    info!("Starting axum server");
+    axum::serve(listener, app).await
+        .map_err(|e| {
+            error!("Axum server error: {}", e);
+            e
+        })?;
 
     Ok(())
 }
@@ -153,10 +179,13 @@ async fn handle_ws_connection(ws: WebSocket, state: Arc<SignalingState>) {
     // Subscribe to room events
     let mut room_rx = state.room_events.subscribe();
 
+    info!("New WebSocket connection established");
+
     // Task 1: Forward internal channel messages to WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+            if let Err(e) = ws_sender.send(Message::Text(msg.into())).await {
+                error!("WebSocket send error: {}", e);
                 break;
             }
         }
@@ -169,6 +198,7 @@ async fn handle_ws_connection(ws: WebSocket, state: Arc<SignalingState>) {
             msg = ws_receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        info!("Received message from client: {}", text);
                         if let Err(e) = handle_signaling_message(
                             &text,
                             &mut peer_id,
@@ -176,11 +206,14 @@ async fn handle_ws_connection(ws: WebSocket, state: Arc<SignalingState>) {
                             &state,
                             &tx,
                         ).await {
-                            warn!(
+                            error!(
                                 "Error handling message from {}: {}",
                                 if peer_id.is_empty() { "unknown" } else { &peer_id },
                                 e
                             );
+                            let _ = tx.send(serde_json::to_string(&SignalMessage::Error {
+                                message: format!("Server error: {}", e),
+                            }).unwrap());
                         }
                     }
                     Some(Ok(Message::Close(_))) => {
@@ -188,22 +221,41 @@ async fn handle_ws_connection(ws: WebSocket, state: Arc<SignalingState>) {
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        let _ = tx.send(String::from_utf8_lossy(&data).to_string());
+                        info!("Received ping from client, sending pong");
+                        if let Err(e) = tx.send(String::from_utf8_lossy(&data).to_string()) {
+                            error!("Failed to send pong response: {}", e);
+                        }
                     }
                     Some(Err(e)) => {
-                        warn!("WebSocket error: {}", e);
+                        error!("WebSocket error: {}", e);
                         break;
                     }
-                    _ => {}
+                    None => {
+                        warn!("WebSocket channel closed unexpectedly");
+                        break;
+                    }
+                    _ => {
+                        warn!("Received unexpected message type");
+                    }
                 }
             }
 
             // Room-level events (peer join/leave)
-            Ok(event) = room_rx.recv() => {
-                if let Err(e) = handle_room_event(event, &peer_id, &tx).await {
-                    warn!("Error handling room event: {}", e);
+            roomevt = room_rx.recv() => {
+                match roomevt {
+                    Ok(event) => {
+                        info!("Received room event: {:?}", event);
+                        if let Err(e) = handle_room_event(event, &peer_id, &tx).await {
+                            error!("Error handling room event: {}", e);
+                        }
+                    }
+                    // Handle channel errors
+                    Err(e) => {
+                        error!("Error receiving room events: {}", e);
+                    }
                 }
             }
+
         }
     }
 
@@ -211,9 +263,12 @@ async fn handle_ws_connection(ws: WebSocket, state: Arc<SignalingState>) {
     if !peer_id.is_empty() {
         info!("Peer {} left", peer_id);
         state.unregister(&peer_id).await;
+    } else {
+        warn!("Connection closed without peer registration");
     }
 
     send_task.abort();
+    info!("WebSocket connection closed");
 }
 
 /// Process a single signaling message from a peer.
@@ -224,12 +279,24 @@ async fn handle_signaling_message(
     state: &Arc<SignalingState>,
     tx: &mpsc::UnboundedSender<String>,
 ) -> anyhow::Result<()> {
-    let msg: SignalMessage = serde_json::from_str(text)?;
+    info!("Handling signaling message: {}", text);
+    
+    let msg: SignalMessage = serde_json::from_str(text)
+        .map_err(|e| {
+            error!("Failed to parse signal message: {}", e);
+            e
+        })?;
+    
     log::debug!("Received: {:?}", msg);
 
     match &msg {
         SignalMessage::Register { id, role } => {
-            handle_register(id, role, peer_id, peer_role, state, tx).await?;
+            info!("Processing register message for peer: {} as {:?}", id, role);
+            handle_register(id, role, peer_id, peer_role, state, tx).await
+                .map_err(|e| {
+                    error!("Registration error: {}", e);
+                    e
+                })?;
         }
 
         SignalMessage::Offer {
@@ -246,6 +313,10 @@ async fn handle_signaling_message(
             info!("Server forwarding to '{}'", to);
             if !state.forward_message(to, text).await {
                 warn!("Failed to forward message to '{}' (peer not found)", to);
+                let err = SignalMessage::Error {
+                    message: format!("Target peer '{}' not found", to),
+                };
+                let _ = tx.send(serde_json::to_string(&err)?);
             }
         }
         SignalMessage::Input {
@@ -257,16 +328,27 @@ async fn handle_signaling_message(
             info!("Server received input event from {} to {}", from, to);
             if !state.forward_message(to, text).await {
                 warn!("Failed to forward input event to {} (peer not found)", to);
+                let err = SignalMessage::Error {
+                    message: format!("Target peer '{}' not found", to),
+                };
+                let _ = tx.send(serde_json::to_string(&err)?);
             }
         }
 
         SignalMessage::RequestConnect { target_id, .. } => {
+            info!("Processing request connect message to target: {}", target_id);
             let enriched = SignalMessage::RequestConnect {
                 from: peer_id.clone(),
                 target_id: target_id.clone(),
             };
-            let enriched_text = serde_json::to_string(&enriched)?;
+            let enriched_text = serde_json::to_string(&enriched)
+                .map_err(|e| {
+                    error!("Failed to serialize enriched connect message: {}", e);
+                    e
+                })?;
+            
             if !state.forward_message(target_id, &enriched_text).await {
+                warn!("Failed to forward connect request to {} (peer not found)", target_id);
                 let err = SignalMessage::Error {
                     message: format!("Target peer '{}' not found", target_id),
                 };
@@ -274,7 +356,14 @@ async fn handle_signaling_message(
             }
         }
 
-        _ => {}
+        SignalMessage::Error { message } => {
+            warn!("Received error message: {}", message);
+            // Error messages are just logged and not forwarded
+        }
+        
+        _ => {
+            warn!("Received unsupported message type: {:?}", msg);
+        }
     }
 
     Ok(())

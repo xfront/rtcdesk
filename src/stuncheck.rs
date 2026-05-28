@@ -6,6 +6,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
+const CHANNEL_CAP: usize = 32;
+const QUERY_TIMEOUT_SECS: u64 = 40;
+const BIND_ADDR: &str = "0.0.0.0:0";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 读取STUN服务器列表
@@ -14,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     f.read_to_string(&mut buf)?;
 
     // 创建通道用于结果收集
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = mpsc::channel(CHANNEL_CAP);
 
     // 为每个STUN服务器创建异步任务
     for server in buf.lines() {
@@ -37,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     // 收集结果
     let mut received = 0;
     let mut resolved_list = Vec::new();
-    let timeout = time::sleep(Duration::from_secs(40));
+    let timeout = time::sleep(Duration::from_secs(QUERY_TIMEOUT_SECS));
     tokio::pin!(timeout);
 
     loop {
@@ -80,7 +84,7 @@ async fn get_public_address(stun_server: &str) -> anyhow::Result<(SocketAddr, Du
     let query_start = std::time::Instant::now();
 
     // 解析本地地址
-    let local_addr: SocketAddr = "0.0.0.0:0".parse()?;
+    let local_addr: SocketAddr = BIND_ADDR.parse()?;
 
     // 创建UDP socket
     let socket = UdpSocket::bind(&local_addr).await?;
