@@ -194,6 +194,21 @@ impl RtcViewer {
         Ok(())
     }
 
+    /// Send a mouse wheel (scroll) event.
+    pub async fn send_wheel_event(&self, dx: i32, dy: i32) -> Result<()> {
+        let ch = self.input_channel.lock().await;
+        if let Some(ref dc) = *ch {
+            let mut payload = Vec::with_capacity(frame::WHEEL_EVENT_SIZE);
+            payload.push(frame::TAG_WHEEL);
+            payload.extend_from_slice(&dx.to_le_bytes());
+            payload.extend_from_slice(&dy.to_le_bytes());
+            dc.send(BytesMut::from(&payload[..]))
+                .await
+                .map_err(|e| anyhow::anyhow!("wheel: {}", e))?;
+        }
+        Ok(())
+    }
+
     /// Send raw clipboard data to the remote host.
     pub async fn send_clipboard_data(&self, data: Vec<u8>) -> Result<()> {
         let ch = self.clipboard_channel.lock().await;

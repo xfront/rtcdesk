@@ -9,8 +9,8 @@ use crate::capture::ScreenCapturer;
 use crate::signal::{self, SignalMessage};
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse};
-use log::{error, info, warn};
+use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse};
+use log::{debug, error, info, warn};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -659,6 +659,7 @@ fn dispatch_input(data: &[u8], peer_id: &str) {
     match tag {
         frame::TAG_MOUSE => dispatch_mouse(data, peer_id),
         frame::TAG_KEY => dispatch_key(data, peer_id),
+        frame::TAG_WHEEL => dispatch_wheel(data, peer_id),
         _ => warn!("[{}] Unknown input event type: 0x{:02X}", peer_id, data[0]),
     }
 }
@@ -718,6 +719,40 @@ fn dispatch_mouse(data: &[u8], peer_id: &str) {
         }
         Err(e) => {
             error!("[{}] Failed to lock enigo: {}", peer_id, e);
+        }
+    }
+}
+
+/// Parse a wheel event and simulate it via `enigo`.
+/// Format: `[0x03][dx:i32le][dy:i32le]`
+fn dispatch_wheel(data: &[u8], peer_id: &str) {
+    if data.len() < frame::WHEEL_EVENT_SIZE {
+        warn!("[{}] Wheel event too short: {} bytes", peer_id, data.len());
+        return;
+    }
+    let dx = i32::from_le_bytes(
+        data[frame::WHEEL_DX_OFF..frame::WHEEL_DY_OFF]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    let dy = i32::from_le_bytes(
+        data[frame::WHEEL_DY_OFF..frame::WHEEL_EVENT_SIZE]
+            .try_into()
+            .unwrap_or_default(),
+    );
+
+    debug!(
+        "[{}] Wheel: dx={} dy={}",
+        peer_id, dx, dy
+    );
+
+    match ENIGO.lock() {
+        Ok(ref mut enigo) => {
+            let _ = enigo.scroll(dy, Axis::Vertical);
+            let _ = enigo.scroll(dx, Axis::Horizontal);
+        }
+        Err(e) => {
+            error!("[{}] Failed to lock enigo for wheel: {}", peer_id, e);
         }
     }
 }

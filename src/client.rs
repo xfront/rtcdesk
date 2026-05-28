@@ -122,6 +122,10 @@ enum InputCmd {
         key_code: u32,
         pressed: bool,
     },
+    Wheel {
+        dx: i32,
+        dy: i32,
+    },
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────
@@ -367,6 +371,9 @@ async fn run_viewer(
                 InputCmd::Key { key_code, pressed } => {
                     let _ = viewer.send_key_event(key_code, pressed).await;
                 }
+                InputCmd::Wheel { dx, dy } => {
+                    let _ = viewer.send_wheel_event(dx, dy).await;
+                }
             },
             Some(q) = qt_rx.recv() => {
                 viewer.set_pic_quality(QUALITY_PRESETS[q].0);
@@ -411,6 +418,18 @@ fn RemoteViewport(
             },
             onmousemove: move |evt| {
                 handle_mouse_event(&evt, MouseAction::Move, &w3, frame_w(), frame_h(), scale_mode(), viewer_input_tx());
+            },
+            onwheel: move |evt| {
+                match viewer_input_tx() {
+                    Some(tx) => {
+                        let v = evt.data().delta().strip_units();
+                        let _ = tx.send(InputCmd::Wheel {
+                            dx: v.x as i32,
+                            dy: v.y as i32,
+                        });
+                    }
+                    None => {}
+                }
             },
             if !has_frame {
                 div { style: "text-align:center;padding:40px;color:{TEXT_WHITE};",

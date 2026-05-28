@@ -36,6 +36,8 @@ pub const FILE_CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
 pub const TAG_MOUSE: u8 = 0x01;
 /// Key event tag byte.
 pub const TAG_KEY: u8 = 0x02;
+/// Wheel event tag byte.
+pub const TAG_WHEEL: u8 = 0x03;
 
 /// Mouse event wire size: tag(1) + x(8) + y(8) + btn(1) + pressed(1).
 pub const MOUSE_EVENT_SIZE: usize = 19;
@@ -54,6 +56,13 @@ pub const KEY_EVENT_SIZE: usize = 6;
 pub const KEY_CODE_OFF: usize = 1;
 /// Byte offset of the pressed boolean.
 pub const KEY_PRESSED_OFF: usize = 5;
+
+/// Wheel event wire size: tag(1) + dx(i32 LE, 4) + dy(i32 LE, 4).
+pub const WHEEL_EVENT_SIZE: usize = 9;
+/// Byte offset of the dx (i32 LE) field.
+pub const WHEEL_DX_OFF: usize = 1;
+/// Byte offset of the dy (i32 LE) field (dx occupies 4 bytes).
+pub const WHEEL_DY_OFF: usize = 5;
 
 // ── Mouse button codes (sent over the wire) ────────────────────────────────
 
