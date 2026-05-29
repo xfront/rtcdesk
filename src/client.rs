@@ -8,16 +8,20 @@ mod frame;
 mod signal;
 mod viewer;
 
-use std::cmp::{self, PartialEq};
+use std::cmp;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::time::Duration;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use dioxus::desktop::tao::window::Fullscreen;
 use dioxus::desktop::{self, use_window};
 use dioxus::prelude::*;
 use dioxus_html::input_data::MouseButton;
 use keyboard_types::{Code, Key};
-use log::{error, info};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use viewer::ViewerCallback;
@@ -88,23 +92,33 @@ struct GuiCallback {
 
 impl ViewerCallback for GuiCallback {
     fn on_connected(&self) {
-        let _ = self.state_tx.send(SessionState::Connected);
+        if let Err(e) = self.state_tx.send(SessionState::Connected) {
+            warn!("[GUI] state_tx send error: {}", e);
+        }
     }
     fn on_disconnected(&self) {
-        let _ = self.state_tx.send(SessionState::Error("连接已断开".into()));
+        if let Err(e) = self.state_tx.send(SessionState::Error("连接已断开".into())) {
+            warn!("[GUI] state_tx send error: {}", e);
+        }
     }
     fn on_frame(&self, data: Vec<u8>, width: u32, height: u32) {
-        let _ = self.frame_tx.send((data, width, height));
+        if let Err(e) = self.frame_tx.send((data, width, height)) {
+            warn!("[GUI] frame_tx send error: {}", e);
+        }
     }
     fn on_connection_state(&self, state: String) {
         info!("[GUI] state: {}", state);
     }
     fn on_error(&self, message: String) {
         error!("[GUI] {}", message);
-        let _ = self.state_tx.send(SessionState::Error(message));
+        if let Err(e) = self.state_tx.send(SessionState::Error(message)) {
+            warn!("[GUI] state_tx error send failed: {}", e);
+        }
     }
     fn on_clipboard_text(&self, text: String) {
-        let _ = self.clipboard_tx.send(text);
+        if let Err(e) = self.clipboard_tx.send(text) {
+            warn!("[GUI] clipboard_tx send error: {}", e);
+        }
     }
     fn on_clipboard_file_uris(&self, uris: String) {
         info!("[GUI] files: {}", uris);
@@ -169,6 +183,8 @@ fn app() -> Element {
             document.head.appendChild(s);
             "#,
         );
+        // document::eval returns Result but in Dioxus it's fire-and-forget in wasm context.
+        // We can't meaningfully handle the error here, so it's left as `let _`.
     });
 
     let cfg = load_config();
@@ -194,8 +210,8 @@ fn ConnectionForm(
 ) -> Element {
     let mut connecting = use_signal(|| false);
     let mut error_msg = use_signal(String::new);
-    let quality_idx = quality();
-    let q = QUALITY_PRESETS[quality_idx];
+    let quality_idx = quality().min(QUALITY_PRESETS.len().saturating_sub(1));
+    let q = &QUALITY_PRESETS[quality_idx];
     let q_label = format!("{} ({}x{} {}FPS)", q.1, q.2, q.3, q.4);
     let blocked = server_addr().is_empty() || remote_id().is_empty() || connecting();
     let btn_bg = if blocked { "#444" } else { ACCENT_GREEN };
@@ -287,7 +303,9 @@ fn handle_quality_select(
     quality_idx.set(idx);
     show_quality_menu.set(false);
     if let Some(tx) = viewer_quality_tx() {
-        let _ = tx.send(idx);
+        if let Err(e) = tx.send(idx) {
+            warn!("[GUI] quality_tx send error: {}", e);
+        }
     }
 }
 
@@ -300,7 +318,9 @@ fn handle_clipboard_toggle(
         if !text.is_empty() && text != local_clipboard() {
             local_clipboard.set(text.clone());
             if let Some(tx) = viewer_clipboard_tx() {
-                let _ = tx.send(text);
+                if let Err(e) = tx.send(text) {
+                    warn!("[GUI] clipboard_tx send error: {}", e);
+                }
             }
             clipboard_synced.set(true);
         }
@@ -339,15 +359,23 @@ async fn run_viewer(
     state_tx_clone: mpsc::UnboundedSender<SessionState>,
     cb: Arc<GuiCallback>,
 ) {
+    let qidx_safe = qidx.min(QUALITY_PRESETS.len().saturating_sub(1));
     let mut viewer = viewer::RtcViewer::new(format!("gui-{}", rand_id()), rid);
     viewer.set_callback(cb);
-    viewer.set_pic_quality(QUALITY_PRESETS[qidx].0);
-    viewer.set_resolution(QUALITY_PRESETS[qidx].2, QUALITY_PRESETS[qidx].3);
-    viewer.set_fps(QUALITY_PRESETS[qidx].4);
+    viewer.set_pic_quality(QUALITY_PRESETS[qidx_safe].0);
+    viewer.set_resolution(QUALITY_PRESETS[qidx_safe].2, QUALITY_PRESETS[qidx_safe].3);
+    viewer.set_fps(QUALITY_PRESETS[qidx_safe].4);
     if let Err(e) = viewer.connect(srv, load_stun_servers()).await {
-        let _ = state_tx_clone.send(SessionState::Error(format!("连接失败: {}", e)));
+        if let Err(se) = state_tx_clone.send(SessionState::Error(format!("连接失败: {}", e))) {
+            warn!("[Gui] state_tx send error on connect failure: {}", se);
+        }
         return;
     }
+    // Clipboard auto-sync: track last sent hash to prevent echo loops.
+    let mut last_clip_sent_hash: u64 = 0;
+    let mut clip_poll = tokio::time::interval(Duration::from_millis(frame::CLIPBOARD_WRITE_POLL_MS));
+    // Skip the first tick (fires immediately).
+    clip_poll.tick().await;
     loop {
         tokio::select! {
             Some((data, w, h)) = frame_rx.recv() => {
@@ -359,33 +387,60 @@ async fn run_viewer(
             Some(text) = clip_rx.recv() => {
                 vs.local_clipboard.set(text.clone());
                 vs.clipboard_synced.set(true);
-                let _ = set_system_clipboard(&text);
+                last_clip_sent_hash = text_hash(&text);
+                if let Err(e) = set_system_clipboard(&text) {
+                    warn!("[Gui] set_system_clipboard error: {}", e);
+                }
             }
             Some(text) = clip_send_rx.recv() => {
-                let _ = viewer.send_clipboard_data(build_clipboard_msg(&text)).await;
+                if let Err(e) = viewer.send_clipboard_data(build_clipboard_msg(&text)).await {
+                    error!("[Gui] send_clipboard_data error: {}", e);
+                }
+                last_clip_sent_hash = text_hash(&text);
             }
             Some(cmd) = input_rx.recv() => match cmd {
                 InputCmd::Mouse { x, y, button, pressed } => {
-                    let _ = viewer.send_mouse_event(x, y, button, pressed).await;
+                    if let Err(e) = viewer.send_mouse_event(x, y, button, pressed).await {
+                        error!("[Gui] send_mouse_event error: {}", e);
+                    }
                 }
                 InputCmd::Key { key_code, pressed } => {
-                    let _ = viewer.send_key_event(key_code, pressed).await;
+                    if let Err(e) = viewer.send_key_event(key_code, pressed).await {
+                        error!("[Gui] send_key_event error: {}", e);
+                    }
                 }
                 InputCmd::Wheel { dx, dy } => {
-                    let _ = viewer.send_wheel_event(dx, dy).await;
+                    if let Err(e) = viewer.send_wheel_event(dx, dy).await {
+                        error!("[Gui] send_wheel_event error: {}", e);
+                    }
                 }
             },
             Some(q) = qt_rx.recv() => {
-                viewer.set_pic_quality(QUALITY_PRESETS[q].0);
-                viewer.set_resolution(QUALITY_PRESETS[q].2, QUALITY_PRESETS[q].3);
-                viewer.set_fps(QUALITY_PRESETS[q].4);
-                let max_dim = cmp::max(QUALITY_PRESETS[q].2, QUALITY_PRESETS[q].3);
-                let _ = viewer.send_quality_update(QUALITY_PRESETS[q].0, max_dim, QUALITY_PRESETS[q].4).await;
+                let qsafe = q.min(QUALITY_PRESETS.len().saturating_sub(1));
+                let qref = &QUALITY_PRESETS[qsafe];
+                viewer.set_pic_quality(qref.0);
+                viewer.set_resolution(qref.2, qref.3);
+                viewer.set_fps(qref.4);
+                let max_dim = cmp::max(qref.2, qref.3);
+                if let Err(e) = viewer.send_quality_update(qref.0, max_dim, qref.4).await {
+                    error!("[Gui] send_quality_update error: {}", e);
+                }
             }
             Some(()) = dc_rx.recv() => {
                 viewer.disconnect().await;
                 vs.page.set(Page::Connect);
                 return;
+            }
+            _ = clip_poll.tick() => {
+                if let Ok(text) = get_system_clipboard() {
+                    let h = text_hash(&text);
+                    if !text.is_empty() && h != last_clip_sent_hash {
+                        last_clip_sent_hash = h;
+                        if let Err(e) = viewer.send_clipboard_data(build_clipboard_msg(&text)).await {
+                            warn!("[Gui] auto clip sync error: {}", e);
+                        }
+                    }
+                }
             }
             else => break,
         }
@@ -422,15 +477,11 @@ fn RemoteViewport(
                 handle_mouse_event(&evt, MouseAction::Move, &w3, frame_w(), frame_h(), scale_mode(), viewer_input_tx());
             },
             onwheel: move |evt| {
-                match viewer_input_tx() {
-                    Some(tx) => {
-                        let v = evt.data().delta().strip_units();
-                        let _ = tx.send(InputCmd::Wheel {
-                            dx: v.x as i32,
-                            dy: v.y as i32,
-                        });
+                if let Some(tx) = viewer_input_tx() {
+                    let v = evt.data().delta().strip_units();
+                    if let Err(e) = tx.send(InputCmd::Wheel { dx: v.x as i32, dy: v.y as i32 }) {
+                        warn!("[GUI] wheel tx send error: {}", e);
                     }
-                    None => {}
                 }
             },
             if !has_frame {
@@ -557,7 +608,7 @@ fn RemoteView(
     let window = use_window();
     let (w4, w5, w_fs) = (window.clone(), window.clone(), window.clone());
     use_effect(move || apply_fullscreen(&w_fs, is_fullscreen()));
-    let q_name = QUALITY_PRESETS[quality_idx()].1;
+    let q_name = QUALITY_PRESETS[quality_idx().min(QUALITY_PRESETS.len().saturating_sub(1))].1;
     let has_frame = !frame_b64().is_empty();
 
     rsx! {
@@ -572,15 +623,19 @@ fn RemoteView(
                 evt.prevent_default();
                 if handle_keydown_local(&evt, is_fullscreen, right_ctrl, &w5) { return; }
                 if let Some(tx) = viewer_input_tx() {
-                    let _ = tx.send(InputCmd::Key {
-                        key_code: key_event_to_code(&evt), pressed: true });
+                    if let Err(e) = tx.send(InputCmd::Key {
+                        key_code: key_event_to_code(&evt), pressed: true }) {
+                        warn!("[GUI] keydown tx error: {}", e);
+                    }
                 }
             },
             onkeyup: move |evt| {
                 if handle_keyup_local(&evt, right_ctrl) { return; }
                 if let Some(tx) = viewer_input_tx() {
-                    let _ = tx.send(InputCmd::Key {
-                        key_code: key_event_to_code(&evt), pressed: false });
+                    if let Err(e) = tx.send(InputCmd::Key {
+                        key_code: key_event_to_code(&evt), pressed: false }) {
+                        warn!("[GUI] keyup tx error: {}", e);
+                    }
                 }
             },
             RemoteViewport {
@@ -597,14 +652,20 @@ fn RemoteView(
                 on_select_scale: move |sm| { scale_mode.set(sm); show_scale_menu.set(false); },
                 on_toggle_clipboard: move |_| handle_clipboard_toggle(local_clipboard, clipboard_synced, viewer_clipboard_tx),
                 on_disconnect: move |_| {
-                    if let Some(tx) = viewer_disconnect_tx() { let _ = tx.send(()); }
+                    if let Some(tx) = viewer_disconnect_tx() {
+                        if let Err(e) = tx.send(()) {
+                            warn!("[GUI] dc_tx send error: {}", e);
+                        }
+                    }
                     page.set(Page::Connect);
                 },
                 on_toggle_fullscreen: move |_| {
                     let fs = !is_fullscreen(); is_fullscreen.set(fs);
                     apply_fullscreen(&w4, fs);
                 },
-                on_minimize: move |_| { let _ = window.set_minimized(true); },
+                on_minimize: move |_| {
+                    window.set_minimized(true)
+                },
                 on_toggle_pin: move |_| toolbar_pinned.set(!toolbar_pinned()),
             }
             ErrorOverlay { state, page }
@@ -753,7 +814,9 @@ fn handle_mouse_event(
         Some(tx) => {
             debug!("MOUSE {:?} ctl=({:.0},{:.0}) elm=({:.0},{:.0}) d=({:.0},{:.0}) win=({:.0},{:.0}) frm={}x{} -> rem=({:.0},{:.0})",
                 action, cc.x, cc.y, ec.x, ec.y, cc.x-ec.x, cc.y-ec.y, ew, eh, frame_w, frame_h, rx, ry);
-            let _ = tx.send(InputCmd::Mouse { x: rx, y: ry, button: btn, pressed: action == MouseAction::Down });
+            if let Err(e) = tx.send(InputCmd::Mouse { x: rx, y: ry, button: btn, pressed: action == MouseAction::Down }) {
+                warn!("[GUI] mouse tx send error: {}", e);
+            }
         }
         None => warn!("MOUSE {:?} dropped: input channel not ready", action),
     }
@@ -967,6 +1030,12 @@ fn set_system_clipboard(text: &str) -> Result<(), String> {
         .map_err(|e| format!("{e}"))
 }
 
+fn text_hash(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 fn build_clipboard_msg(text: &str) -> Vec<u8> {
     let mut v = vec![frame::CLIP_TAG_TEXT];
     v.extend_from_slice(text.as_bytes());
@@ -1045,10 +1114,14 @@ fn load_config() -> AppConfig {
 fn save_config(cfg: &AppConfig) {
     let path = config_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("[GUI] Failed to create config dir {}: {}", parent.display(), e);
+        }
     }
     if let Ok(json) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(&path, json);
+        if let Err(e) = std::fs::write(&path, json) {
+            warn!("[GUI] Failed to save config to {}: {}", path.display(), e);
+        }
     }
 }
 

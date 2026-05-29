@@ -246,7 +246,9 @@ async fn dispatch_host_message(
             if let Some((_, peer)) = sessions.lock().await.iter().find(|(id, _)| id == &from) {
                 // Apply viewer-requested capturer params (quality, resolution).
                 peer.apply_capturer_params_from_sdp(&sdp);
-                let _ = peer.set_remote_description(&sdp, RTCSdpType::Answer).await;
+                if let Err(e) = peer.set_remote_description(&sdp, RTCSdpType::Answer).await {
+                    error!("[Host] set_remote_description(Answer) from {}: {}", from, e);
+                }
 
                 // Now start streaming with the viewer's preferred FPS
                 // instead of the hard-coded default.
@@ -272,13 +274,16 @@ async fn dispatch_host_message(
             ..
         } => {
             if let Some((_, peer)) = sessions.lock().await.iter().find(|(id, _)| id == &from) {
-                let _ = peer
+                if let Err(e) = peer
                     .add_ice_candidate(
                         &candidate,
                         &sdp_mid.unwrap_or_default(),
                         sdp_mline_index.unwrap_or(0),
                     )
-                    .await;
+                    .await
+                {
+                    error!("[Host] add_ice_candidate from {}: {}", from, e);
+                }
             }
         }
         SignalMessage::QualityUpdate {
@@ -325,9 +330,17 @@ fn spawn_ice_forwarder(
             if let SignalMessage::IceCandidate { to, .. } = &mut msg {
                 *to = ice_viewer_id.clone();
             }
-            let json = serde_json::to_string(&msg).unwrap_or_default();
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("[ICE fwd] serialize error: {}", e);
+                    continue;
+                }
+            };
             let mut w = ice_ws.lock().await;
-            let _ = w.send(Message::Text(json.into())).await;
+            if let Err(e) = w.send(Message::Text(json.into())).await {
+                error!("[ICE fwd] WS send error: {}", e);
+            }
         }
     });
     Ok(())

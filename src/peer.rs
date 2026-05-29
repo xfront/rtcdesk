@@ -128,7 +128,9 @@ impl PeerConnectionEventHandler for SignalingEventHandler {
                 sdp_mid: init.sdp_mid,
                 sdp_mline_index: init.sdp_mline_index,
             };
-            let _ = self.ice_tx.send(msg);
+            if let Err(e) = self.ice_tx.send(msg) {
+                error!("[{}] ICE candidate send error: {}", self.peer_id, e);
+            }
             info!("[{}] ICE candidate generated", self.peer_id);
         }
     }
@@ -628,7 +630,9 @@ async fn run_stream_loop(
             tokio::time::sleep(interval - elapsed).await;
         }
     }
-    let _ = pc.close().await;
+    if let Err(e) = pc.close().await {
+        error!("Stream loop peer_connection.close() error: {}", e);
+    }
 }
 
 /// Build a WebRTC configuration with STUN servers.
@@ -722,7 +726,9 @@ fn dispatch_mouse(data: &[u8], peer_id: &str) {
     match ENIGO.lock() {
         Ok(ref mut enigo) => {
             // Move to target position (absolute coordinates)
-            let _ = enigo.move_mouse(x as i32, y as i32, Coordinate::Abs);
+            if let Err(e) = enigo.move_mouse(x as i32, y as i32, Coordinate::Abs) {
+                error!("[{}] enigo.move_mouse error: {}", peer_id, e);
+            }
 
             // Map button code to enigo Button
             let btn = match button {
@@ -741,7 +747,9 @@ fn dispatch_mouse(data: &[u8], peer_id: &str) {
             } else {
                 Direction::Release
             };
-            let _ = enigo.button(btn, dir);
+            if let Err(e) = enigo.button(btn, dir) {
+                error!("[{}] enigo.button({:?}, {:?}) error: {}", peer_id, btn, dir, e);
+            }
         }
         Err(e) => {
             error!("[{}] Failed to lock enigo: {}", peer_id, e);
@@ -774,8 +782,12 @@ fn dispatch_wheel(data: &[u8], peer_id: &str) {
 
     match ENIGO.lock() {
         Ok(ref mut enigo) => {
-            let _ = enigo.scroll(dy, Axis::Vertical);
-            let _ = enigo.scroll(dx, Axis::Horizontal);
+            if let Err(e) = enigo.scroll(dy, Axis::Vertical) {
+                error!("[{}] enigo.scroll(vertical) error: {}", peer_id, e);
+            }
+            if let Err(e) = enigo.scroll(dx, Axis::Horizontal) {
+                error!("[{}] enigo.scroll(horizontal) error: {}", peer_id, e);
+            }
         }
         Err(e) => {
             error!("[{}] Failed to lock enigo for wheel: {}", peer_id, e);
@@ -966,7 +978,9 @@ fn handle_file_list(data: &[u8], peer_id: &str) -> Option<ClipState> {
 
     // Create temp directory for received files
     let dir = std::env::temp_dir().join("rtcdesk-clipboard");
-    let _ = fs::create_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        error!("[{}] Failed to create temp dir {}: {}", peer_id, dir.display(), e);
+    }
 
     for _ in 0..count {
         if offset + 2 > data.len() {
@@ -1074,12 +1088,16 @@ fn handle_transfer_complete(state: Option<ClipState>, peer_id: &str) {
             "[{}] Failed to set clipboard (neither xclip nor wl-copy available)",
             peer_id
         );
-        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(&uri_text));
+        if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(&uri_text)) {
+            error!("[{}] arboard fallback set_text error: {}", peer_id, e);
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(&uri_text));
+        if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(&uri_text)) {
+            error!("[{}] arboard set_text error: {}", peer_id, e);
+        }
     }
 
     // Trigger paste via xdotool so the transferred files appear in the active window.
@@ -1105,12 +1123,18 @@ fn set_clipboard_uris(uri_text: &str) -> Result<(), ()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|_| ())?;
+        .map_err(|e| {
+            error!("xclip spawn error: {}", e);
+        })?;
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        let _ = stdin.write_all(uri_text.as_bytes());
+        if let Err(e) = stdin.write_all(uri_text.as_bytes()) {
+            error!("xclip stdin write error: {}", e);
+        }
     }
-    child.wait().map_err(|_| ())?;
+    child.wait().map_err(|e| {
+        error!("xclip wait error: {}", e);
+    })?;
     Ok(())
 }
 
@@ -1122,12 +1146,18 @@ fn set_clipboard_wlcopy(uri_text: &str) -> Result<(), ()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|_| ())?;
+        .map_err(|e| {
+            error!("wl-copy spawn error: {}", e);
+        })?;
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        let _ = stdin.write_all(uri_text.as_bytes());
+        if let Err(e) = stdin.write_all(uri_text.as_bytes()) {
+            error!("wl-copy stdin write error: {}", e);
+        }
     }
-    child.wait().map_err(|_| ())?;
+    child.wait().map_err(|e| {
+        error!("wl-copy wait error: {}", e);
+    })?;
     Ok(())
 }
 
@@ -1148,7 +1178,9 @@ fn paste_text_via_xclip_xdotool(text: &str, peer_id: &str) {
         Ok(mut child) => {
             if let Some(mut stdin) = child.stdin.take() {
                 use std::io::Write;
-                let _ = stdin.write_all(text.as_bytes());
+                if let Err(e) = stdin.write_all(text.as_bytes()) {
+                    error!("[{}] xclip stdin write error (paste): {}", peer_id, e);
+                }
             }
             match child.wait() {
                 Ok(status) if status.success() => {
@@ -1207,7 +1239,9 @@ fn set_clipboard_text(text: &str, peer_id: &str) {
     {
         use std::io::Write;
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+            if let Err(e) = stdin.write_all(text.as_bytes()) {
+                error!("[{}] xclip stdin write error: {}", peer_id, e);
+            }
         }
         match child.wait() {
             Ok(status) if status.success() => {
@@ -1242,9 +1276,13 @@ fn set_clipboard_text(text: &str, peer_id: &str) {
     {
         use std::io::Write;
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+            if let Err(e) = stdin.write_all(text.as_bytes()) {
+                error!("[{}] wl-copy stdin write error: {}", peer_id, e);
+            }
         }
-        let _ = child.wait();
+        if let Err(e) = child.wait() {
+            error!("[{}] wl-copy wait error: {}", peer_id, e);
+        }
     }
 }
 
@@ -1420,7 +1458,9 @@ async fn send_host_clipboard_files(
     }
 
     // Complete marker
-    let _ = dc.send(BytesMut::from(&[frame::CLIP_TAG_DONE][..])).await;
+    if let Err(e) = dc.send(BytesMut::from(&[frame::CLIP_TAG_DONE][..])).await {
+        error!("[{}] Failed to send clipboard done marker: {}", peer_id, e);
+    }
     info!(
         "[{}] Sent {} host clipboard files to viewer",
         peer_id,

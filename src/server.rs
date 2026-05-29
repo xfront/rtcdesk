@@ -15,6 +15,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
+/// Helper: log an error when a channel `send()` fails.
+macro_rules! log_send_err {
+    ($expr:expr, $ctx:expr) => {
+        if let Err(e) = $expr {
+            warn!("[Server] {}: send failed: {}", $ctx, e);
+        }
+    };
+}
+/// Helper: log an error when a broadcast `send()` fails.
+macro_rules! log_broadcast_err {
+    ($expr:expr, $ctx:expr) => {
+        if let Err(e) = $expr {
+            warn!("[Server] {}: broadcast failed: {}", $ctx, e);
+        }
+    };
+}
+
 /// Shared application state for the signaling server.
 pub struct SignalingState {
     /// Connected peers: id -> (role, message_tx)
@@ -59,9 +76,12 @@ impl SignalingState {
         // Remove existing peer with same ID if any
         if peers.remove(peer_id).is_some() {
             info!("Removing existing peer with ID: {}", peer_id);
-            let _ = self.room_events.send(RoomEvent::PeerLeft {
-                id: peer_id.to_string(),
-            });
+            log_broadcast_err!(
+                self.room_events.send(RoomEvent::PeerLeft {
+                    id: peer_id.to_string(),
+                }),
+                "PeerLeft remove-existing"
+            );
         }
 
         let info = PeerInfo {
@@ -71,10 +91,13 @@ impl SignalingState {
         peers.insert(peer_id.to_string(), info);
 
         info!("Registered new peer: {} as {:?}", peer_id, role);
-        let _ = self.room_events.send(RoomEvent::PeerJoined {
-            id: peer_id.to_string(),
-            role,
-        });
+        log_broadcast_err!(
+            self.room_events.send(RoomEvent::PeerJoined {
+                id: peer_id.to_string(),
+                role,
+            }),
+            "PeerJoined"
+        );
     }
 
     /// Unregister a peer.
@@ -82,9 +105,12 @@ impl SignalingState {
         let mut peers = self.peers.write().await;
         if peers.remove(peer_id).is_some() {
             info!("Unregistering peer: {}", peer_id);
-            let _ = self.room_events.send(RoomEvent::PeerLeft {
-                id: peer_id.to_string(),
-            });
+            log_broadcast_err!(
+                self.room_events.send(RoomEvent::PeerLeft {
+                    id: peer_id.to_string(),
+                }),
+                "PeerLeft unregister"
+            );
         }
     }
 
@@ -211,9 +237,13 @@ async fn handle_ws_connection(ws: WebSocket, state: Arc<SignalingState>) {
                                 if peer_id.is_empty() { "unknown" } else { &peer_id },
                                 e
                             );
-                            let _ = tx.send(serde_json::to_string(&SignalMessage::Error {
+                            let err_json = serde_json::to_string(&SignalMessage::Error {
                                 message: format!("Server error: {}", e),
-                            }).unwrap());
+                            }).unwrap_or_else(|se| {
+                                error!("[Server] Failed to serialize error message: {}", se);
+                                r#"{"type":"error","message":"internal error"}"#.to_string()
+                            });
+                            log_send_err!(tx.send(err_json), "error response");
                         }
                     }
                     Some(Ok(Message::Close(_))) => {
@@ -317,7 +347,7 @@ async fn handle_signaling_message(
                 let err = SignalMessage::Error {
                     message: format!("Target peer '{}' not found", to),
                 };
-                let _ = tx.send(serde_json::to_string(&err)?);
+                log_send_err!(tx.send(serde_json::to_string(&err)?), "error on forward");
             }
         }
         SignalMessage::Input {
@@ -332,7 +362,7 @@ async fn handle_signaling_message(
                 let err = SignalMessage::Error {
                     message: format!("Target peer '{}' not found", to),
                 };
-                let _ = tx.send(serde_json::to_string(&err)?);
+                log_send_err!(tx.send(serde_json::to_string(&err)?), "error on input forward");
             }
         }
 
@@ -353,7 +383,7 @@ async fn handle_signaling_message(
                 let err = SignalMessage::Error {
                     message: format!("Target peer '{}' not found", target_id),
                 };
-                let _ = tx.send(serde_json::to_string(&err)?);
+                log_send_err!(tx.send(serde_json::to_string(&err)?), "error on connect forward");
             }
         }
 
@@ -386,7 +416,7 @@ async fn handle_register(
     let ack = SignalMessage::Registered {
         assigned_id: id.to_string(),
     };
-    let _ = tx.send(serde_json::to_string(&ack)?);
+    log_send_err!(tx.send(serde_json::to_string(&ack)?), "register ack");
 
     // Notify about existing peers in the room
     let hosts = state.get_hosts().await;
@@ -396,7 +426,7 @@ async fn handle_register(
                 id: host_id.clone(),
                 role: PeerRole::Host,
             };
-            let _ = tx.send(serde_json::to_string(&notify)?);
+            log_send_err!(tx.send(serde_json::to_string(&notify)?), "existing host notify");
         }
     }
     let viewers = state.get_viewers().await;
@@ -406,7 +436,7 @@ async fn handle_register(
                 id: viewer_id.clone(),
                 role: PeerRole::Viewer,
             };
-            let _ = tx.send(serde_json::to_string(&notify)?);
+            log_send_err!(tx.send(serde_json::to_string(&notify)?), "existing viewer notify");
         }
     }
 
@@ -424,13 +454,13 @@ async fn handle_room_event(
         RoomEvent::PeerJoined { id, role } => {
             if id != my_id {
                 let msg = SignalMessage::PeerJoined { id, role };
-                let _ = tx.send(serde_json::to_string(&msg)?);
+                log_send_err!(tx.send(serde_json::to_string(&msg)?), "room PeerJoined");
             }
         }
         RoomEvent::PeerLeft { id } => {
             if id != my_id {
                 let msg = SignalMessage::PeerLeft { id };
-                let _ = tx.send(serde_json::to_string(&msg)?);
+                log_send_err!(tx.send(serde_json::to_string(&msg)?), "room PeerLeft");
             }
         }
     }

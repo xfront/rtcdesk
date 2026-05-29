@@ -293,7 +293,9 @@ impl RtcViewer {
     pub async fn disconnect(&self) {
         self.connected.store(false, Ordering::SeqCst);
         if let Some(ref pc) = self.pc {
-            let _ = pc.close().await;
+            if let Err(e) = pc.close().await {
+                error!("[Viewer] disconnect close error: {}", e);
+            }
         }
     }
 
@@ -504,7 +506,9 @@ fn handle_viewer_file_list(data: &[u8]) -> Option<ClipViewerState> {
     let mut files: Vec<(std::path::PathBuf, std::fs::File, u64)> = Vec::new();
 
     let dir = std::env::temp_dir().join("rtcdesk-clipboard");
-    let _ = std::fs::create_dir_all(&dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        error!("[Viewer] Failed to create temp dir {}: {}", dir.display(), e);
+    }
 
     for _ in 0..count {
         if offset + 2 > data.len() {
@@ -604,12 +608,21 @@ fn spawn_ice_forwarder(
             if let SignalMessage::IceCandidate { to, .. } = &mut msg {
                 *to = host_id.clone();
             }
-            let json = serde_json::to_string(&msg).unwrap();
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("[Viewer] ICE candidate serialize error: {}", e);
+                    continue;
+                }
+            };
             let mut ws = ws_write.lock().await;
             if let Some(ref mut w) = *ws {
-                let _ = w
+                if let Err(e) = w
                     .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
-                    .await;
+                    .await
+                {
+                    error!("[Viewer] ICE candidate WS send error: {}", e);
+                }
             }
         }
     });
@@ -730,7 +743,7 @@ async fn handle_offer(
             ..
         } => {
             if let Some(pc) = pc {
-                let _ = pc
+                if let Err(e) = pc
                     .add_ice_candidate(webrtc::peer_connection::RTCIceCandidateInit {
                         candidate,
                         sdp_mid,
@@ -738,7 +751,10 @@ async fn handle_offer(
                         username_fragment: None,
                         url: None,
                     })
-                    .await;
+                    .await
+                {
+                    error!("[Viewer] add_ice_candidate error: {}", e);
+                }
             }
         }
         SignalMessage::PeerLeft { id } if id == *host_id => {
@@ -784,7 +800,10 @@ async fn process_offer(
     }
     match pc.create_answer(None).await {
         Ok(answer) => {
-            let _ = pc.set_local_description(answer.clone()).await;
+            if let Err(e) = pc.set_local_description(answer.clone()).await {
+                error!("[Viewer] set_local_description failed: {}", e);
+                return;
+            }
             let sdp_with_params = format!(
                 "{}\n{}",
                 answer.sdp,
@@ -799,10 +818,19 @@ async fn process_offer(
                 to: host_id.to_string(),
                 sdp: sdp_with_params,
             };
-            let json = serde_json::to_string(&am).unwrap();
+            let json = match serde_json::to_string(&am) {
+                Ok(j) => j,
+                Err(e) => {
+                    error!("[Viewer] Answer serialize error: {}", e);
+                    return;
+                }
+            };
             let mut ws = ws_write.lock().await;
             if let Some(ref mut w) = *ws {
-                let _ = w.send(TM::Text(json.into())).await;
+                if let Err(e) = w.send(TM::Text(json.into())).await {
+                    error!("[Viewer] Answer WS send error: {}", e);
+                    return;
+                }
             }
             info!("[{}] Answer sent", viewer_id);
             if let Some(c) = callback {
@@ -849,7 +877,9 @@ impl PeerConnectionEventHandler for SignalingEventHandler {
                 sdp_mid: init.sdp_mid,
                 sdp_mline_index: init.sdp_mline_index,
             };
-            let _ = self.ice_tx.send(msg);
+            if let Err(e) = self.ice_tx.send(msg) {
+                error!("[{}] ICE candidate send error: {}", self.peer_id, e);
+            }
         }
     }
     async fn on_ice_connection_state_change(&self, s: RTCIceConnectionState) {
@@ -861,7 +891,9 @@ impl PeerConnectionEventHandler for SignalingEventHandler {
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         let label = dc.label().await.unwrap_or_default();
         info!("[{}] Remote DC '{}'", self.peer_id, label);
-        let _ = self.dc_tx.send(dc);
+        if let Err(e) = self.dc_tx.send(dc) {
+            error!("[{}] dc_tx send error: {}", self.peer_id, e);
+        }
     }
 }
 
