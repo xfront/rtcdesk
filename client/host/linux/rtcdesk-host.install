@@ -1,0 +1,36 @@
+#!/bin/bash
+# RTCDesk — Post-install / pre-remove scripts for the host service
+# Usage (as root):
+#   ./rtcdesk-host.install install    — enable & start the systemd service
+#   ./rtcdesk-host.install remove     — stop & disable the service
+
+set -e
+
+SERVICE_NAME="rtcdesk-host"
+SERVICE_SRC="$(dirname "$0")/rtcdesk-host.service"
+SERVICE_DST="/etc/systemd/system/${SERVICE_NAME}.service"
+
+case "$1" in
+    install)
+        echo "Installing ${SERVICE_NAME} systemd service..."
+        cp "${SERVICE_SRC}" "${SERVICE_DST}"
+        systemctl daemon-reload
+        systemctl enable "${SERVICE_NAME}"
+        systemctl start "${SERVICE_NAME}"
+        echo "Service ${SERVICE_NAME} installed and started."
+        echo "  Status:  systemctl status ${SERVICE_NAME}"
+        echo "  Logs:    journalctl -u ${SERVICE_NAME} -f"
+        ;;
+    remove)
+        echo "Removing ${SERVICE_NAME} systemd service..."
+        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+        systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+        rm -f "${SERVICE_DST}"
+        systemctl daemon-reload
+        echo "Service ${SERVICE_NAME} removed."
+        ;;
+    *)
+        echo "Usage: $0 {install|remove}"
+        exit 1
+        ;;
+esac

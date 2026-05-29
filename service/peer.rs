@@ -5,14 +5,11 @@
 //!
 //! Uses webrtc-rs 0.20 alpha API with sans-IO architecture.
 
-use crate::capture::ScreenCapturer;
-use crate::signal::{self, SignalMessage};
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse};
 use log::{debug, error, info, warn};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Seek, SeekFrom, Write};
@@ -24,9 +21,8 @@ use std::time::Duration;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 
 // ── Key code constants ─────────────────────────────────────────────────────
-// (Mirrored from frame.rs for local use; shared VK codes are frame::VK_*.)
-use crate::frame::{
-    self, VK_ALT, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
+use frame::{
+    VK_ALT, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
     VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V,
 };
 const ASCII_PRINTABLE_MIN: u32 = 0x21;
@@ -36,6 +32,9 @@ use webrtc::peer_connection::{
     RTCConfigurationBuilder, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
     RTCPeerConnectionState, RTCSdpType, RTCSessionDescription,
 };
+use shared::{frame, signal};
+use shared::signal::SignalMessage;
+use crate::capture::ScreenCapturer;
 
 /// Single global `enigo` instance — re‑using the same X11/Wayland connection is **required**
 /// so that modifier keys (Ctrl/Shift/Alt) remain active when the next key arrives.
@@ -160,8 +159,6 @@ impl PeerConnectionEventHandler for SignalingEventHandler {
 pub struct RtcPeer {
     /// The underlying WebRTC peer connection.
     peer_connection: Arc<dyn PeerConnection>,
-    /// Input data channel for sending input events (mouse/keyboard).
-    input_channel: Option<Arc<dyn DataChannel>>,
     /// Our peer ID.
     peer_id: String,
     /// Screen capturer for desktop frames.
@@ -183,42 +180,6 @@ pub struct RtcPeer {
 }
 
 impl RtcPeer {
-    /// Send a mouse input event.
-    pub async fn send_mouse_event(&self, x: f64, y: f64, button: u8, pressed: bool) -> Result<()> {
-        let mut payload = Vec::with_capacity(frame::MOUSE_EVENT_SIZE);
-        payload.push(frame::TAG_MOUSE);
-        payload.extend_from_slice(&x.to_le_bytes());
-        payload.extend_from_slice(&y.to_le_bytes());
-        payload.push(button);
-        payload.push(if pressed { 1 } else { 0 });
-
-        // Send the event through the input data channel
-        if let Some(ref dc) = self.input_channel {
-            dc.send(BytesMut::from(&payload[..]))
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send mouse event: {}", e))
-        } else {
-            Err(anyhow::anyhow!("No input channel available"))
-        }
-    }
-
-    /// Send a keyboard input event.
-    pub async fn send_key_event(&self, key_code: u32, pressed: bool) -> Result<()> {
-        let mut payload = Vec::with_capacity(frame::KEY_EVENT_SIZE);
-        payload.push(frame::TAG_KEY);
-        payload.extend_from_slice(&key_code.to_le_bytes());
-        payload.push(if pressed { 1 } else { 0 });
-
-        // Send the event through the input data channel
-        if let Some(ref dc) = self.input_channel {
-            dc.send(BytesMut::from(&payload[..]))
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send key event: {}", e))
-        } else {
-            Err(anyhow::anyhow!("No input channel available"))
-        }
-    }
-
     /// Create a new RTC peer (host mode) with desktop sharing capability.
     pub async fn new_host(peer_id: &str, stun_servers: &[String]) -> Result<Self> {
         let config = build_configuration(stun_servers);
@@ -250,50 +211,6 @@ impl RtcPeer {
 
         Ok(Self {
             peer_connection: pc,
-            input_channel: None,
-            peer_id: peer_id.to_string(),
-            capturer: None,
-            frame_channel: None,
-            ice_tx,
-            ice_rx: Some(ice_rx),
-            connection_ready,
-            dc_ready,
-            running,
-            fps: Arc::new(AtomicU32::new(frame::DEFAULT_FPS)),
-        })
-    }
-
-    /// Create a new RTC peer (viewer mode).
-    pub async fn new_viewer(peer_id: &str, stun_servers: &[String]) -> Result<Self> {
-        let config = build_configuration(stun_servers);
-        let (ice_tx, ice_rx) = tokio::sync::mpsc::unbounded_channel();
-        let connection_ready = Arc::new(tokio::sync::Notify::new());
-        let dc_ready = Arc::new(tokio::sync::Notify::new());
-        let running = Arc::new(AtomicBool::new(true));
-
-        let handler = Arc::new(SignalingEventHandler::new(
-            ice_tx.clone(),
-            peer_id.to_string(),
-            connection_ready.clone(),
-            running.clone(),
-        ));
-
-        let pc = PeerConnectionBuilder::new()
-            .with_configuration(config)
-            .with_handler(handler)
-            .with_udp_addrs(discover_udp_addrs())
-            .build()
-            .await
-            .context("failed to build peer connection")?;
-
-        let pc: Box<dyn PeerConnection> = Box::new(pc);
-        let pc = Arc::from(pc);
-
-        info!("[{}] Viewer peer connection created", peer_id);
-
-        Ok(Self {
-            peer_connection: pc,
-            input_channel: None,
             peer_id: peer_id.to_string(),
             capturer: None,
             frame_channel: None,
@@ -828,11 +745,6 @@ fn dispatch_key(data: &[u8], peer_id: &str) {
     }
 
     // ── Ctrl+V → xclip + xdotool (Linux only) ──────────────────────────
-    // enigo's `Key::Unicode('v')` emits a raw Unicode text event that
-    // BYPASSES the X11 modifier processing pipeline.  Ctrl held via enigo
-    // + Unicode('v') is therefore NOT a Ctrl+V shortcut on X11.
-    // On Windows, `SendInput` with `KEYEVENTF_UNICODE` handles modifier
-    // combinations correctly, so we let the normal enigo path handle it.
     #[cfg(target_os = "linux")]
     if pressed && key_code == VK_V && CTRL_HELD.load(Ordering::Relaxed) {
         info!(

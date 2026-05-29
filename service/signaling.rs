@@ -3,8 +3,6 @@
 //! Handles peer registration, room management, and message forwarding
 //! between hosts and viewers for WebRTC session establishment.
 
-use crate::frame;
-use crate::signal::{PeerRole, SignalMessage};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::response::IntoResponse;
@@ -14,6 +12,8 @@ use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
+use shared::frame;
+use shared::signal::{PeerRole, SignalMessage};
 
 /// Helper: log an error when a channel `send()` fails.
 macro_rules! log_send_err {
@@ -238,7 +238,7 @@ async fn handle_ws_connection(ws: WebSocket, state: Arc<SignalingState>) {
                                 e
                             );
                             let err_json = serde_json::to_string(&SignalMessage::Error {
-                                message: format!("Server error: {}", e),
+                                message: format!("Server error: {:?}", e),
                             }).unwrap_or_else(|se| {
                                 error!("[Server] Failed to serialize error message: {}", se);
                                 r#"{"type":"error","message":"internal error"}"#.to_string()

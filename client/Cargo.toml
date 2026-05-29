@@ -1,0 +1,38 @@
+[package]
+name = "rtcdesk-client"
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rtcdesk"
+path = "main.rs"
+
+[dependencies]
+rtcdesk-shared = { path = "../shared" }
+webrtc.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+env_logger.workspace = true
+local-ip-address.workspace = true
+arboard.workspace = true
+base64.workspace = true
+keyboard-types.workspace = true
+dioxus-html={ version = "0.7" }
+dioxus = { version = "0.7" }
+image.workspace = true
+
+[features]
+default = ["desktop"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]

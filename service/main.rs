@@ -14,16 +14,10 @@
 //! - `RTCDESK_ID` - host peer ID (default: auto-generated UUID)
 //! - `RTCDESK_FPS` - streaming frame rate (default: 15)
 
-mod capture;
-mod frame;
 mod peer;
-mod server;
-mod signal;
+mod capture;
+mod signaling;
 
-use crate::capture::ScreenCapturer;
-use crate::peer::RtcPeer;
-use crate::server::SignalingState;
-use crate::signal::{PeerRole, SignalMessage};
 use anyhow::{Context, Result};
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
@@ -33,6 +27,11 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use webrtc::peer_connection::RTCSdpType;
+use shared::{frame, signal};
+use shared::signal::{PeerRole, SignalMessage};
+use crate::capture::ScreenCapturer;
+use crate::peer::RtcPeer;
+use crate::signaling::SignalingState;
 
 /// Shared WebSocket writer type — mutex-wrapped so it can be shared across tasks
 /// (especially the ICE-candidate forward task).
@@ -84,7 +83,7 @@ async fn init_host() -> Result<HostContext> {
     let state_clone = state.clone();
     let addr_clone = bind_addr.clone();
     tokio::spawn(async move {
-        if let Err(e) = server::start_signaling_server(state_clone, &addr_clone).await {
+        if let Err(e) = signaling::start_signaling_server(state_clone, &addr_clone).await {
             error!("Signaling server error: {}", e);
         }
     });
@@ -165,7 +164,8 @@ async fn main() -> Result<()> {
     } = ctx;
 
     info!("Waiting for viewers...");
-    run_host_loop(
+
+    let run = run_host_loop(
         &host_id,
         &ws_write,
         &mut ws_read,
@@ -173,8 +173,43 @@ async fn main() -> Result<()> {
         capturer.as_ref(),
         fps,
         &sessions,
-    )
-    .await
+    );
+
+    tokio::select! {
+        res = run => {
+            if let Err(ref e) = res {
+                error!("Host loop exited with error: {}", e);
+            }
+            res
+        }
+        _ = shutdown_signal() => {
+            info!("Received shutdown signal, exiting gracefully...");
+            Ok(())
+        }
+    }
+}
+
+/// Wait for a shutdown signal (SIGTERM, SIGINT, or Ctrl+C).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        if let Ok(mut sigterm) = sigterm {
+            let sigint = tokio::signal::ctrl_c();
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    info!("SIGTERM received");
+                }
+                _ = sigint => {
+                    info!("SIGINT received");
+                }
+            }
+            return;
+        }
+    }
+    // Fallback / Windows: just wait for Ctrl+C
+    let _ = tokio::signal::ctrl_c().await;
+    info!("Ctrl+C received");
 }
 
 /// Main message processing loop for the host.
@@ -251,7 +286,6 @@ async fn dispatch_host_message(
                 }
 
                 // Now start streaming with the viewer's preferred FPS
-                // instead of the hard-coded default.
                 let cp = signal::extract_capturer_params_from_sdp(&sdp);
                 let viewer_fps = cp.fps.unwrap_or(fps);
                 info!(
@@ -355,13 +389,13 @@ async fn setup_input_and_clipboard(
     let input_dc = peer.create_frame_channel("input").await?;
     let running = peer.running_flag();
     let input_peer_id = viewer_id.to_string();
-    crate::peer::spawn_input_reader(input_dc, running.clone(), input_peer_id);
+    peer::spawn_input_reader(input_dc, running.clone(), input_peer_id);
 
     let clipboard_dc = peer.create_frame_channel("clipboard").await?;
     let clip_peer_id = viewer_id.to_string();
     let clip_dc_writer = clipboard_dc.clone();
-    crate::peer::spawn_clipboard_reader(clipboard_dc, running.clone(), clip_peer_id.clone());
-    crate::peer::spawn_clipboard_writer(clip_dc_writer, running, clip_peer_id);
+    peer::spawn_clipboard_reader(clipboard_dc, running.clone(), clip_peer_id.clone());
+    peer::spawn_clipboard_writer(clip_dc_writer, running, clip_peer_id);
     Ok(())
 }
 
@@ -382,18 +416,14 @@ async fn handle_connect(
         peer.attach_capturer(c.clone())?;
     }
 
-    // Create data channel BEFORE creating the offer so that the
-    // offer SDP includes the data channel media section with ICE credentials.
     let dc = peer.create_frame_channel("desktop").await?;
     peer.set_frame_channel(dc);
 
     let peer = Arc::new(peer);
     setup_input_and_clipboard(&peer, viewer_id).await?;
 
-    // Create offer
     let offer = peer.create_offer().await?;
 
-    // Send offer to viewer
     let msg = SignalMessage::Offer {
         from: host_id.to_string(),
         to: viewer_id.to_string(),
@@ -406,9 +436,6 @@ async fn handle_connect(
         .map_err(|_e| anyhow::anyhow!("WS send error"))?;
     info!("Sent offer to {}", viewer_id);
 
-    // Don't start streaming here — wait for the Answer which carries
-    // the viewer's preferred fps, quality, and resolution. Streaming
-    // will be started when the Answer is received (see dispatch_host_message).
     sessions.lock().await.push((viewer_id.to_string(), peer));
     Ok(())
 }
@@ -429,7 +456,6 @@ async fn handle_remote_offer(
         peer.attach_capturer(c.clone())?;
     }
 
-    // Extract capturer params from the viewer's Offer SDP
     peer.apply_capturer_params_from_sdp(sdp_str);
     info!(
         "[{}] Applied capturer params from remote Offer SDP",
@@ -459,7 +485,6 @@ async fn handle_remote_offer(
         .map_err(|_e| anyhow::anyhow!("WS send error"))?;
     info!("Sent answer to {}", viewer_id);
 
-    // Start streaming with the viewer's preferred FPS from the Offer SDP
     let cp = signal::extract_capturer_params_from_sdp(sdp_str);
     let viewer_fps = cp.fps.unwrap_or(_fps);
     info!(

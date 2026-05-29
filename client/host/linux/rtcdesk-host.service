@@ -1,0 +1,33 @@
+# RTCDesk Host Service — systemd unit
+# Installed alongside the rtcdesk client app by the post-install script.
+#
+# After installing the rtcdesk client, enable & start the host:
+#   sudo systemctl enable --now rtcdesk-host
+#   sudo systemctl status rtcdesk-host
+#   journalctl -u rtcdesk-host -f
+
+[Unit]
+Description=RTCDesk Remote Desktop Host
+After=network.target
+Documentation=https://github.com/itfront/RtcDesk
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/Rtcdesk/service
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+Environment=RTCDESK_FPS=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rtcdesk-host
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log
+
+[Install]
+WantedBy=multi-user.target

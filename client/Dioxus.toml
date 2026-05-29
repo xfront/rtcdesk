@@ -1,0 +1,63 @@
+# RTCDesk Client — Dioxus Configuration
+# =====================================================================
+
+[application]
+name = "RTCDesk"
+
+# ── General Bundle ───────────────────────────────────────────────────
+[bundle]
+identifier = "com.rtcdesk.app"
+icon = ["assets/favicon.ico"]
+short_description = "Remote Desktop via WebRTC"
+long_description = "A cross-platform remote desktop viewer and host using WebRTC for peer-to-peer screen sharing, remote input, and clipboard sync."
+publisher = "itfront"
+category = "Network"
+copyright = "2025 itfront"
+
+# 相对于 Dioxus.toml 所在目录
+external_bin = ["host/rtcdesk-service-*"]
+
+# ── Windows ──────────────────────────────────────────────────────────
+[windows]
+icon = ["assets/favicon.ico"]
+
+# NSIS installer (recommended — simple .exe setup)
+[windows.nsis]
+install_mode = "CurrentUser"
+start_menu_folder = "RTCDesk"
+installer_icon = "assets/favicon.ico"
+
+# WiX MSI installer (requires WiX Toolset on build machine)
+# language format: [[lang, locale_path], ...]  — locale_path can be omitted
+[windows.wix]
+
+# ── macOS ────────────────────────────────────────────────────────────
+[macos]
+minimum_system_version = "10.15"
+
+# ── Linux ────────────────────────────────────────────────────────────
+[linux]
+categories = ["Network", "RemoteAccess"]
+
+# Debian package dependencies (Dioxus desktop needs GTK/X11)
+[linux.deb]
+depends = [
+    "libgtk-3-0",
+    "libgdk-3-0",
+    "libglib2.0-0",
+    "libx11-6",
+    "libxdo3",
+]
+section = "net"
+priority = "optional"
+
+# ── Web (WASM) ───────────────────────────────────────────────────────
+[web.app]
+title = "rtcdesk"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+script = []

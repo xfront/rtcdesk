@@ -1,7 +1,5 @@
 //! WebRTC viewer client for RTCDesk.
 
-use crate::frame::FrameAssembler;
-use crate::signal::{self, PeerRole, SignalMessage};
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use log::{error, info, warn};
@@ -16,7 +14,9 @@ use webrtc::peer_connection::{
     RTCConfigurationBuilder, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
     RTCPeerConnectionState, RTCSessionDescription,
 };
-use crate::frame;
+use shared::{frame, signal};
+use shared::frame::FrameAssembler;
+use shared::signal::{PeerRole, SignalMessage};
 
 pub trait ViewerCallback: Send + Sync {
     fn on_connected(&self);

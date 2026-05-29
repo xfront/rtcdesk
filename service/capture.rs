@@ -5,7 +5,6 @@
 //! JPEG lossy compression keeps frames around 30-60 KB for 720p,
 //! which fits in 2-4 SCTP chunks (vs. ~500 KB for PNG = 34 chunks).
 
-use crate::frame;
 
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageEncoder};
@@ -13,6 +12,7 @@ use log::{debug, info};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::time::Duration;
 use xcap::Monitor;
+use shared::frame;
 
 /// A single captured frame with metadata.
 #[derive(Debug, Clone)]

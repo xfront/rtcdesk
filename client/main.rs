@@ -4,8 +4,6 @@
 //! Connects to a signaling server as a viewer and renders the remote desktop stream
 //! with a Remmina-style floating toolbar, quality/scale controls, and clipboard sync.
 
-mod frame;
-mod signal;
 mod viewer;
 
 use std::cmp;
@@ -24,7 +22,8 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
 use tokio::sync::mpsc;
-use viewer::ViewerCallback;
+use shared::frame;
+use crate::viewer::{RtcViewer, ViewerCallback};
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
 const MAIN_CSS: Asset = asset!("/assets/main.css");
@@ -151,17 +150,38 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            desktop::Config::new().with_window(
-                desktop::WindowBuilder::new()
-                    .with_title("RTCDesk")
-                    .with_decorations(false) // start undecorated; we add them back on startup
-                    .with_min_inner_size(desktop::LogicalSize::new(frame::MIN_WINDOW_W as i32, frame::MIN_WINDOW_H as i32))
-                    .with_inner_size(desktop::LogicalSize::new(frame::DEFAULT_WINDOW_W as i32, frame::DEFAULT_WINDOW_H as i32)),
-            ),
-        )
+
+    // Load app icon (embedded at compile time)
+    let window_icon = load_window_icon();
+
+    let mut win_builder = desktop::WindowBuilder::new()
+        .with_title("RTCDesk")
+        .with_decorations(false) // start undecorated; we add them back on startup
+        .with_min_inner_size(desktop::LogicalSize::new(
+            frame::MIN_WINDOW_W as i32,
+            frame::MIN_WINDOW_H as i32,
+        ))
+        .with_inner_size(desktop::LogicalSize::new(
+            frame::DEFAULT_WINDOW_W as i32,
+            frame::DEFAULT_WINDOW_H as i32,
+        ));
+
+    if let Some(icon) = window_icon {
+        win_builder = win_builder.with_window_icon(Some(icon));
+    }
+
+    dioxus::LaunchBuilder::new()
+        .with_cfg(desktop::Config::new().with_window(win_builder))
         .launch(app);
+}
+
+/// Try to load the window icon from the embedded favicon.ico asset.
+fn load_window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
+    let bytes = include_bytes!("assets/favicon.ico");
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    dioxus::desktop::tao::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
 
 // ─── Root component ───────────────────────────────────────────────────
@@ -362,7 +382,7 @@ async fn run_viewer(
     cb: Arc<GuiCallback>,
 ) {
     let qidx_safe = qidx.min(QUALITY_PRESETS.len().saturating_sub(1));
-    let mut viewer = viewer::RtcViewer::new(format!("gui-{}", rand_id()), rid);
+    let mut viewer = RtcViewer::new(format!("gui-{}", rand_id()), rid);
     viewer.set_callback(cb);
     viewer.set_pic_quality(QUALITY_PRESETS[qidx_safe].0);
     viewer.set_resolution(QUALITY_PRESETS[qidx_safe].2, QUALITY_PRESETS[qidx_safe].3);

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WinSW configuration for RTCDesk Host Service
+  Place WinSW.exe (renamed to rtcdesk-host-service.exe) and this XML
+  alongside the service.exe binary.
+
+  Install:  rtcdesk-host-service.exe install
+  Start:    rtcdesk-host-service.exe start
+  Uninstall: rtcdesk-host-service.exe uninstall
+-->
+<service>
+  <id>RTCDeskHost</id>
+  <name>RTCDesk Remote Desktop Host</name>
+  <description>WebRTC-based remote desktop host service</description>
+  <executable>%BASE%\rtcdesk-service.exe</executable>
+  <arguments></arguments>
+
+  <env name="RUST_LOG" value="info"/>
+  <env name="RTCDESK_FPS" value="30"/>
+
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+
+  <stoptimeout>15 sec</stoptimeout>
+</service>
