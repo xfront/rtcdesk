@@ -21,7 +21,10 @@ use crate::frame;
 pub trait ViewerCallback: Send + Sync {
     fn on_connected(&self);
     fn on_disconnected(&self);
-    fn on_frame(&self, data: Vec<u8>, width: u32, height: u32);
+    /// Called when a complete desktop frame has been reassembled.
+    /// `orig_w`/`orig_h` are the remote monitor's actual resolution (for mouse mapping);
+    /// `frame_w`/`frame_h` are the JPEG dimensions (may differ if the host down-scaled).
+    fn on_frame(&self, data: Vec<u8>, orig_w: u32, orig_h: u32, frame_w: u32, frame_h: u32);
     fn on_connection_state(&self, state: String);
     fn on_error(&self, message: String);
     /// Called when the remote host sent text clipboard data.
@@ -419,10 +422,28 @@ async fn assemble_desktop_frames(
             Some(DataChannelEvent::OnMessage(msg)) => {
                 if let Some(merged) = assembler.push(&msg.data) {
                     if merged.len() >= frame::FRAME_HDR_SIZE {
-                        let w = u32::from_be_bytes([merged[0], merged[1], merged[2], merged[3]]);
-                        let h = u32::from_be_bytes([merged[4], merged[5], merged[6], merged[7]]);
+                        let orig_w = u32::from_be_bytes(
+                            merged[frame::FRAME_ORIG_W_OFF..frame::FRAME_ORIG_H_OFF]
+                                .try_into()
+                                .unwrap_or([0; 4]),
+                        );
+                        let orig_h = u32::from_be_bytes(
+                            merged[frame::FRAME_ORIG_H_OFF..frame::FRAME_W_OFF]
+                                .try_into()
+                                .unwrap_or([0; 4]),
+                        );
+                        let w = u32::from_be_bytes(
+                            merged[frame::FRAME_W_OFF..frame::FRAME_H_OFF]
+                                .try_into()
+                                .unwrap_or([0; 4]),
+                        );
+                        let h = u32::from_be_bytes(
+                            merged[frame::FRAME_H_OFF..frame::FRAME_HDR_SIZE]
+                                .try_into()
+                                .unwrap_or([0; 4]),
+                        );
                         if let Some(ref c) = callback {
-                            c.on_frame(merged[frame::FRAME_HDR_SIZE..].to_vec(), w, h);
+                            c.on_frame(merged[frame::FRAME_HDR_SIZE..].to_vec(), orig_w, orig_h, w, h);
                         }
                     }
                 }

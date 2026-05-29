@@ -19,9 +19,13 @@ use xcap::Monitor;
 pub struct CapturedFrame {
     /// Encoded JPEG data.
     pub data: Vec<u8>,
-    /// Frame width in pixels.
+    /// Original (unscaled) monitor width — for accurate mouse coordinate mapping.
+    pub orig_width: u32,
+    /// Original (unscaled) monitor height.
+    pub orig_height: u32,
+    /// Frame width in pixels (may be ≤ orig_width if down-scaled).
     pub width: u32,
-    /// Frame height in pixels.
+    /// Frame height in pixels (may be ≤ orig_height if down-scaled).
     pub height: u32,
 }
 
@@ -96,17 +100,17 @@ impl ScreenCapturer {
             .context("failed to capture screen")?;
         let t1 = t0.elapsed();
 
-        let (width, height) = (rgba.width(), rgba.height());
+        let (orig_width, orig_height) = (rgba.width(), rgba.height());
         let max_dim = self.max_dimension.load(Ordering::Relaxed);
         let mut dyn_image = DynamicImage::ImageRgba8(rgba);
 
-        // Scale down if too large
-        if width > max_dim || height > max_dim {
+        // Scale down if too large (image::resize preserves aspect ratio)
+        if orig_width > max_dim || orig_height > max_dim {
             dyn_image = dyn_image.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3);
             debug!(
                 "Scaled frame from {}x{} to {}x{}",
-                width,
-                height,
+                orig_width,
+                orig_height,
                 dyn_image.width(),
                 dyn_image.height(),
             );
@@ -114,6 +118,7 @@ impl ScreenCapturer {
 
         // Convert RGBA → RGB (JPEG doesn't support alpha channel)
         let rgb = dyn_image.to_rgb8();
+        let (frame_w, frame_h) = (rgb.width(), rgb.height());
 
         let jpeg_q = self.jpeg_quality.load(Ordering::Relaxed);
         // JPEG encode with configured quality
@@ -129,10 +134,12 @@ impl ScreenCapturer {
         let jpeg_data = buffer.into_inner();
         let t3 = t0.elapsed();
         let kb = jpeg_data.len() / 1024;
+        let is_scaled = frame_w != orig_width || frame_h != orig_height;
         info!(
-            "Capture: {}x{} → {} KB, X11={:.0}ms convert+encode={:.0}ms total={:.0}ms (JPEG Q={})",
-            rgb.width(),
-            rgb.height(),
+            "Capture: {}x{} → {}x{}{} → {} KB, X11={:.0}ms convert+encode={:.0}ms total={:.0}ms (JPEG Q={})",
+            orig_width, orig_height,
+            frame_w, frame_h,
+            if is_scaled { " (scaled)" } else { "" },
             kb,
             t1.as_millis(),
             (t3 - t1).as_millis(),
@@ -142,8 +149,10 @@ impl ScreenCapturer {
 
         Ok(CapturedFrame {
             data: jpeg_data,
-            width: rgb.width(),
-            height: rgb.height(),
+            orig_width,
+            orig_height,
+            width: frame_w,
+            height: frame_h,
         })
     }
 

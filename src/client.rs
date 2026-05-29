@@ -85,7 +85,7 @@ enum SessionState {
 // ─── Viewer callback bridge ───────────────────────────────────────────
 
 struct GuiCallback {
-    frame_tx: mpsc::UnboundedSender<(Vec<u8>, u32, u32)>,
+    frame_tx: mpsc::UnboundedSender<(Vec<u8>, u32, u32, u32, u32)>,
     state_tx: mpsc::UnboundedSender<SessionState>,
     clipboard_tx: mpsc::UnboundedSender<String>,
 }
@@ -101,8 +101,8 @@ impl ViewerCallback for GuiCallback {
             warn!("[GUI] state_tx send error: {}", e);
         }
     }
-    fn on_frame(&self, data: Vec<u8>, width: u32, height: u32) {
-        if let Err(e) = self.frame_tx.send((data, width, height)) {
+    fn on_frame(&self, data: Vec<u8>, orig_w: u32, orig_h: u32, frame_w: u32, frame_h: u32) {
+        if let Err(e) = self.frame_tx.send((data, orig_w, orig_h, frame_w, frame_h)) {
             warn!("[GUI] frame_tx send error: {}", e);
         }
     }
@@ -332,6 +332,8 @@ fn handle_clipboard_toggle(
 
 struct ViewerState {
     frame_b64: Signal<String>,
+    orig_w: Signal<u32>,
+    orig_h: Signal<u32>,
     frame_w: Signal<u32>,
     frame_h: Signal<u32>,
     state: Signal<SessionState>,
@@ -349,7 +351,7 @@ async fn run_viewer(
     rid: String,
     qidx: usize,
     mut vs: ViewerState,
-    mut frame_rx: mpsc::UnboundedReceiver<(Vec<u8>, u32, u32)>,
+    mut frame_rx: mpsc::UnboundedReceiver<(Vec<u8>, u32, u32, u32, u32)>,
     mut state_rx: mpsc::UnboundedReceiver<SessionState>,
     mut clip_rx: mpsc::UnboundedReceiver<String>,
     mut input_rx: mpsc::UnboundedReceiver<InputCmd>,
@@ -378,8 +380,10 @@ async fn run_viewer(
     clip_poll.tick().await;
     loop {
         tokio::select! {
-            Some((data, w, h)) = frame_rx.recv() => {
+            Some((data, ow, oh, w, h)) = frame_rx.recv() => {
                 vs.frame_b64.set(format!("data:image/jpeg;base64,{}", BASE64.encode(&data)));
+                vs.orig_w.set(ow);
+                vs.orig_h.set(oh);
                 vs.frame_w.set(w);
                 vs.frame_h.set(h);
             }
@@ -453,6 +457,8 @@ async fn run_viewer(
 fn RemoteViewport(
     state: Signal<SessionState>,
     frame_b64: Signal<String>,
+    orig_w: Signal<u32>,
+    orig_h: Signal<u32>,
     frame_w: Signal<u32>,
     frame_h: Signal<u32>,
     scale_mode: Signal<ScaleMode>,
@@ -468,13 +474,13 @@ fn RemoteViewport(
     rsx! {
         div { style: "position:relative;display:flex;align-items:center;justify-content:center;{display_style}",
             onmousedown: move |evt| {
-                handle_mouse_event(&evt, MouseAction::Down, &w1, frame_w(), frame_h(), scale_mode(), viewer_input_tx());
+                handle_mouse_event(&evt, MouseAction::Down, &w1, orig_w(), orig_h(), frame_w(), frame_h(), scale_mode(), viewer_input_tx());
             },
             onmouseup: move |evt| {
-                handle_mouse_event(&evt, MouseAction::Up, &w2, frame_w(), frame_h(), scale_mode(), viewer_input_tx());
+                handle_mouse_event(&evt, MouseAction::Up, &w2, orig_w(), orig_h(), frame_w(), frame_h(), scale_mode(), viewer_input_tx());
             },
             onmousemove: move |evt| {
-                handle_mouse_event(&evt, MouseAction::Move, &w3, frame_w(), frame_h(), scale_mode(), viewer_input_tx());
+                handle_mouse_event(&evt, MouseAction::Move, &w3, orig_w(), orig_h(), frame_w(), frame_h(), scale_mode(), viewer_input_tx());
             },
             onwheel: move |evt| {
                 if let Some(tx) = viewer_input_tx() {
@@ -537,6 +543,8 @@ fn RemoteView(
 ) -> Element {
     let mut state = use_signal(|| SessionState::Connecting);
     let mut frame_b64 = use_signal(String::new);
+    let mut orig_w = use_signal(|| frame::DEFAULT_FRAME_W);
+    let mut orig_h = use_signal(|| frame::DEFAULT_FRAME_H);
     let mut frame_w = use_signal(|| frame::DEFAULT_FRAME_W);
     let mut frame_h = use_signal(|| frame::DEFAULT_FRAME_H);
     let mut toolbar_visible = use_signal(|| true);
@@ -560,6 +568,8 @@ fn RemoteView(
         let qidx = quality_idx();
         let vs = ViewerState {
             frame_b64,
+            orig_w,
+            orig_h,
             frame_w,
             frame_h,
             state,
@@ -569,7 +579,7 @@ fn RemoteView(
         };
 
         // Create channels synchronously so signals are populated before render completes
-        let (frame_tx, frame_rx) = mpsc::unbounded_channel::<(Vec<u8>, u32, u32)>();
+        let (frame_tx, frame_rx) = mpsc::unbounded_channel::<(Vec<u8>, u32, u32, u32, u32)>();
         let (state_tx, state_rx) = mpsc::unbounded_channel::<SessionState>();
         let (clip_tx, clip_rx) = mpsc::unbounded_channel::<String>();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<InputCmd>();
@@ -639,7 +649,7 @@ fn RemoteView(
                 }
             },
             RemoteViewport {
-                state, frame_b64, frame_w, frame_h, scale_mode, has_frame,
+                state, frame_b64, orig_w, orig_h, frame_w, frame_h, scale_mode, has_frame,
                 viewer_input_tx,
             }
             RemoteToolbar {
@@ -799,21 +809,23 @@ fn handle_mouse_event(
     evt: &Event<MouseData>,
     action: MouseAction,
     win: &dioxus::desktop::DesktopService,
+    orig_w: u32,
+    orig_h: u32,
     frame_w: u32,
     frame_h: u32,
     scale_mode: ScaleMode,
     tx: Option<mpsc::UnboundedSender<InputCmd>>,
 ) {
     let (ew, eh) = logical_size(win);
-    let (rx, ry) = relative_coords(evt, frame_w, frame_h, scale_mode, ew, eh);
+    let (rx, ry) = relative_coords(evt, orig_w, orig_h, frame_w, frame_h, scale_mode, ew, eh);
     let cc = evt.data().client_coordinates();
     let ec = evt.data().element_coordinates();
 
     let btn = if action == MouseAction::Move { frame::BTN_MOVE } else { mouse_button(evt) };
     match tx {
         Some(tx) => {
-            debug!("MOUSE {:?} ctl=({:.0},{:.0}) elm=({:.0},{:.0}) d=({:.0},{:.0}) win=({:.0},{:.0}) frm={}x{} -> rem=({:.0},{:.0})",
-                action, cc.x, cc.y, ec.x, ec.y, cc.x-ec.x, cc.y-ec.y, ew, eh, frame_w, frame_h, rx, ry);
+            debug!("MOUSE {:?} ctl=({:.0},{:.0}) elm=({:.0},{:.0}) d=({:.0},{:.0}) win=({:.0},{:.0}) orig={}x{} frm={}x{} -> rem=({:.0},{:.0})",
+                action, cc.x, cc.y, ec.x, ec.y, cc.x-ec.x, cc.y-ec.y, ew, eh, orig_w, orig_h, frame_w, frame_h, rx, ry);
             if let Err(e) = tx.send(InputCmd::Mouse { x: rx, y: ry, button: btn, pressed: action == MouseAction::Down }) {
                 warn!("[GUI] mouse tx send error: {}", e);
             }
@@ -834,36 +846,52 @@ fn mouse_button(evt: &Event<MouseData>) -> u8 {
         .unwrap_or(frame::BTN_LEFT)
 }
 
+/// Map element coordinates (relative to the viewport div) to the remote host's
+/// **original** screen coordinates, accounting for both the current ScaleMode
+/// (how the frame is rendered in the window) and any down-scaling that the host
+/// applied when capturing (frame_w vs orig_w).
+///
+/// ── Pipeline ──────────────────────────────────────────────────────────
+///   element pixel  ──[ScaleMode]──▶  frame pixel  ──[scale factor]──▶  remote screen pixel
+///
+/// For example, a 1920×1080 remote screen captured at "均衡" quality sends
+/// 1280×720 frames.  A click at the window center maps to (640,360) in frame
+/// space, then (960,540) in the actual 1920×1080 remote screen space.
 fn relative_coords(
     evt: &Event<MouseData>,
-    frame_w: u32,
-    frame_h: u32,
+    orig_w: u32,  // remote monitor actual width
+    orig_h: u32,  // remote monitor actual height
+    frame_w: u32, // JPEG frame width (may be < orig_w)
+    frame_h: u32, // JPEG frame height (may be < orig_h)
     scale: ScaleMode,
     elem_w: f64,
     elem_h: f64,
 ) -> (f64, f64) {
-    // element_coordinates gives position relative to the inner div that hosts the image.
-    // This is the most reliable coordinate system – it accounts for any offset, margin,
-    // or DPI scaling that client_coordinates might miss.
     let ec = evt.data().element_coordinates();
     let cx = ec.x as f64;
     let cy = ec.y as f64;
 
     let fw = frame_w as f64;
     let fh = frame_h as f64;
+    let ow = orig_w as f64;
+    let oh = orig_h as f64;
+
     if elem_w <= 1.0 || elem_h <= 1.0 || fw <= 1.0 || fh <= 1.0 {
-        return (cx.clamp(0.0, fw), cy.clamp(0.0, fh));
+        return (cx.clamp(0.0, ow), cy.clamp(0.0, oh));
     }
 
-    match scale {
+    // ── Step 1: element pixel → frame pixel (depends on ScaleMode) ──
+    let (fx, fy) = match scale {
         ScaleMode::Fit => {
             let aspect = fw / fh;
             let elem_aspect = elem_w / elem_h;
             let (img_w, img_h, off_x, off_y) = if elem_aspect > aspect {
+                // Container wider than image → letterbox on left/right
                 let h = elem_h;
                 let w = h * aspect;
                 (w, h, (elem_w - w) / 2.0, 0.0)
             } else {
+                // Container taller than image → letterbox on top/bottom
                 let w = elem_w;
                 let h = w / aspect;
                 (w, h, 0.0, (elem_h - h) / 2.0)
@@ -873,11 +901,17 @@ fn relative_coords(
                 ((cy - off_y) / img_h * fh).clamp(0.0, fh),
             )
         }
-        ScaleMode::Stretch => (
-            (cx / elem_w * fw).clamp(0.0, fw),
-            (cy / elem_h * fh).clamp(0.0, fh),
-        ),
+        ScaleMode::Stretch => {
+            // Image fills the entire container; linear mapping
+            (
+                (cx / elem_w * fw).clamp(0.0, fw),
+                (cy / elem_h * fh).clamp(0.0, fh),
+            )
+        }
         ScaleMode::Original => {
+            // Image shown at 1:1 pixel size (CSS object-fit: none).
+            // When the image is larger than the container it is clipped;
+            // when smaller it is centered with margins.
             let iw = fw.min(elem_w);
             let ih = fh.min(elem_h);
             let oxf = (elem_w - iw).max(0.0) / 2.0;
@@ -887,7 +921,17 @@ fn relative_coords(
                 ((cy - oyf) / ih * fh).clamp(0.0, fh),
             )
         }
-    }
+    };
+
+    // ── Step 2: frame pixel → original screen pixel ──
+    // Scale up from the (possibly down-scaled) frame coords to the
+    // actual remote monitor coordinates.
+    let scale_x = ow / fw; // > 1.0 when host down-scaled
+    let scale_y = oh / fh;
+    (
+        (fx * scale_x).clamp(0.0, ow),
+        (fy * scale_y).clamp(0.0, oh),
+    )
 }
 
 fn frame_display_style(scale: ScaleMode) -> &'static str {

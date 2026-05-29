@@ -23,8 +23,21 @@ pub const CHUNK_WIRE_SIZE: usize = CHUNK_HDR_SIZE + CHUNK_DATA_SIZE;
 
 // ── Wire format sizes ──────────────────────────────────────────────────────
 
-/// Frame header size: width (u32 BE) + height (u32 BE).
-pub const FRAME_HDR_SIZE: usize = 8;
+/// Frame header size:
+///   orig_w (u32 BE) + orig_h (u32 BE) + frame_w (u32 BE) + frame_h (u32 BE).
+///
+/// `orig_*` are the actual remote monitor dimensions (for mouse coordinate mapping);
+/// `frame_*` are the possibly down-scaled JPEG dimensions (for display layout).
+pub const FRAME_HDR_SIZE: usize = 16;
+
+/// Byte offset of the original (unscaled) width in the frame header.
+pub const FRAME_ORIG_W_OFF: usize = 0;
+/// Byte offset of the original (unscaled) height.
+pub const FRAME_ORIG_H_OFF: usize = 4;
+/// Byte offset of the scaled frame width.
+pub const FRAME_W_OFF: usize = 8;
+/// Byte offset of the scaled frame height.
+pub const FRAME_H_OFF: usize = 12;
 /// Chunk header size: frame_id (u32 BE) + chunk_ix (u32 BE) + total_chunks (u32 BE).
 pub const CHUNK_HDR_SIZE: usize = 12;
 /// File chunk size for clipboard transfer.

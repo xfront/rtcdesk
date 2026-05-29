@@ -603,6 +603,9 @@ async fn run_stream_loop(
 
         let fid = frame_counter.fetch_add(1, Ordering::Relaxed);
         let mut payload = Vec::with_capacity(frame::FRAME_HDR_SIZE + frame.data.len());
+        // Extended header: [orig_w:u32 BE][orig_h:u32 BE][frame_w:u32 BE][frame_h:u32 BE]
+        payload.extend_from_slice(&frame.orig_width.to_be_bytes());
+        payload.extend_from_slice(&frame.orig_height.to_be_bytes());
         payload.extend_from_slice(&frame.width.to_be_bytes());
         payload.extend_from_slice(&frame.height.to_be_bytes());
         payload.extend_from_slice(&frame.data);
