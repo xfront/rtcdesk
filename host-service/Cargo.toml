@@ -1,13 +1,13 @@
 [package]
-name = "rtcdesk-service"
+name = "rtcdesk-host"
 version.workspace = true
 authors.workspace = true
 description.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "rtcdesk-service"
-path = "main.rs"
+name = "rtcdesk-host"
+path = "src/main.rs"
 
 [dependencies]
 rtcdesk-shared = { path = "../shared" }
@@ -15,10 +15,10 @@ webrtc.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true
-rcgen.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
+env_logger.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 futures-util.workspace = true
@@ -26,10 +26,9 @@ bytes.workspace = true
 async-trait.workspace = true
 image.workspace = true
 xcap.workspace = true
-axum.workspace = true
-env_logger.workspace = true
-local-ip-address.workspace = true
 enigo.workspace = true
-arboard.workspace = true
 keyboard-types.workspace = true
-base64.workspace = true
+clipboard-rs.workspace = true
+local-ip-address.workspace = true
+dirs = "6"
+toml = "0.8"

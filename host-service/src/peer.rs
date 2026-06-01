@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
+use clipboard_rs::{Clipboard, ClipboardContext, RustImageData, common::RustImage};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse};
 use log::{debug, error, info, warn};
 use std::collections::hash_map::DefaultHasher;
@@ -14,7 +15,6 @@ use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -42,14 +42,11 @@ static ENIGO: LazyLock<Mutex<Enigo>> =
     LazyLock::new(|| Mutex::new(Enigo::new(&enigo::Settings::default()).expect("enigo init")));
 
 /// Track whether Ctrl is currently held via enigo so `dispatch_key` can detect
-/// Ctrl+V and delegate the paste to xclip+xdotool.  enigo's `Key::Unicode` sends
-/// a raw text-input event that bypasses the keyboard modifier pipeline, so
-/// Ctrl+Unicode('v') is NEVER interpreted as Ctrl+V by the OS.
+/// Ctrl+V and delegate the paste via clipboard-rs.
 static CTRL_HELD: AtomicBool = AtomicBool::new(false);
 
 /// Last plain-text clipboard content received from the viewer.  Used by the
-/// Ctrl+V handler to re‑populate the X11 clipboard (via xclip) right before
-/// triggering paste, guarding against clipboard-manager ownership loss.
+/// Ctrl+V handler to re-populate the clipboard right before triggering paste.
 static LAST_RECEIVED_TEXT: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 
 /// Compute a stable hash for clipboard text, used to detect sync loops.
@@ -59,18 +56,30 @@ fn text_hash(s: &str) -> u64 {
     h.finish()
 }
 
-/// Shared state for clipboard sync loop prevention.
-///
-/// When we receive clipboard text from the viewer and write it to the local
-/// X11 clipboard via `set_clipboard_text`, we record its hash here so the
-/// writer thread can recognise the subsequent X11 clipboard change as our
-/// own echo and skip sending it back to the viewer.
+fn bytes_hash(b: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    b.hash(&mut h);
+    h.finish()
+}
+
+/// Shared state for clipboard text sync loop prevention.
 struct ClipboardSyncState {
+    last_received_hash: u64,
+}
+
+/// Shared state for clipboard image sync loop prevention.
+struct ClipboardImageSyncState {
     last_received_hash: u64,
 }
 
 static CLIP_SYNC: LazyLock<Mutex<ClipboardSyncState>> = LazyLock::new(|| {
     Mutex::new(ClipboardSyncState {
+        last_received_hash: 0,
+    })
+});
+
+static CLIP_IMAGE_SYNC: LazyLock<Mutex<ClipboardImageSyncState>> = LazyLock::new(|| {
+    Mutex::new(ClipboardImageSyncState {
         last_received_hash: 0,
     })
 });
@@ -116,21 +125,31 @@ impl SignalingEventHandler {
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for SignalingEventHandler {
     async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
-        if let Ok(init) = event.candidate.to_json() {
-            if init.candidate.is_empty() {
-                return;
+        match event.candidate.to_json() {
+            Ok(init) => {
+                if init.candidate.is_empty() {
+                    // End-of-candidates indicator; not an error.
+                    info!("[{}] ICE candidate gathering complete", self.peer_id);
+                    return;
+                }
+                let msg = SignalMessage::IceCandidate {
+                    from: self.peer_id.clone(),
+                    to: String::new(), // Set by sender
+                    candidate: init.candidate,
+                    sdp_mid: init.sdp_mid,
+                    sdp_mline_index: init.sdp_mline_index,
+                };
+                if let Err(e) = self.ice_tx.send(msg) {
+                    error!("[{}] ICE candidate send error: {}", self.peer_id, e);
+                }
+                info!("[{}] ICE candidate generated", self.peer_id);
             }
-            let msg = SignalMessage::IceCandidate {
-                from: self.peer_id.clone(),
-                to: String::new(), // Set by sender
-                candidate: init.candidate,
-                sdp_mid: init.sdp_mid,
-                sdp_mline_index: init.sdp_mline_index,
-            };
-            if let Err(e) = self.ice_tx.send(msg) {
-                error!("[{}] ICE candidate send error: {}", self.peer_id, e);
+            Err(e) => {
+                error!(
+                    "[{}] ICE candidate to_json() failed: {}",
+                    self.peer_id, e
+                );
             }
-            info!("[{}] ICE candidate generated", self.peer_id);
         }
     }
 
@@ -177,6 +196,8 @@ pub struct RtcPeer {
     running: Arc<AtomicBool>,
     /// Current target FPS (updated dynamically via QualityUpdate).
     fps: Arc<AtomicU32>,
+    /// Guard against calling pc.close() more than once (prevents double-close panic/crash).
+    pc_closed: Arc<AtomicBool>,
 }
 
 impl RtcPeer {
@@ -220,6 +241,7 @@ impl RtcPeer {
             dc_ready,
             running,
             fps: Arc::new(AtomicU32::new(frame::DEFAULT_FPS)),
+            pc_closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -468,8 +490,9 @@ impl RtcPeer {
         let peer_id = self.peer_id.clone();
         let running = self.running.clone();
         let pc = self.peer_connection.clone();
+        let pc_closed = self.pc_closed.clone();
         tokio::spawn(async move {
-            run_stream_loop(capturer, dc, dynamic_fps, running, pc).await;
+            run_stream_loop(capturer, dc, dynamic_fps, running, pc, pc_closed).await;
             info!("[{}] Streaming loop ended", peer_id);
         });
 
@@ -477,10 +500,45 @@ impl RtcPeer {
     }
 
     /// Close the peer connection.
+    /// Sets `running = false` first so spawned tasks (input/clipboard
+    /// readers, stream loop) detect the shutdown and exit gracefully.
+    /// Uses an atomic guard to prevent double-close.
     pub async fn close(&self) -> Result<()> {
-        self.peer_connection.close().await?;
-        info!("[{}] Peer connection closed", self.peer_id);
-        Ok(())
+        // Prevent double-close (can happen when both the stream loop and the
+        // host cleanup try to close the same peer connection concurrently).
+        if self.pc_closed.swap(true, Ordering::SeqCst) {
+            info!(
+                "[{}] Peer connection already closed, skipping",
+                self.peer_id
+            );
+            return Ok(());
+        }
+        // Signal all spawned tasks to stop BEFORE closing the peer connection,
+        // so they don't keep polling a closing data channel.
+        self.running.store(false, Ordering::Relaxed);
+        // Close with a timeout to prevent hanging on a stuck peer connection.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.peer_connection.close(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                info!("[{}] Peer connection closed", self.peer_id);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                error!("[{}] Peer connection close error: {}", self.peer_id, e);
+                Err(anyhow::anyhow!("close error: {}", e))
+            }
+            Err(_) => {
+                warn!(
+                    "[{}] Timed out waiting for peer connection to close",
+                    self.peer_id
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -492,6 +550,7 @@ async fn run_stream_loop(
     fps: Arc<AtomicU32>,
     running: Arc<AtomicBool>,
     pc: Arc<dyn PeerConnection>,
+    pc_closed: Arc<AtomicBool>,
 ) {
     let frame_counter = Arc::new(AtomicU32::new(0));
     loop {
@@ -550,20 +609,37 @@ async fn run_stream_loop(
             tokio::time::sleep(interval - elapsed).await;
         }
     }
-    if let Err(e) = pc.close().await {
-        error!("Stream loop peer_connection.close() error: {}", e);
+    // Only close if not already closed (e.g. by RtcPeer::close() from the
+    // host cleanup path). Data channel send failures also end up here and
+    // should trigger a graceful PC close.
+    if !pc_closed.swap(true, Ordering::SeqCst) {
+        running.store(false, Ordering::Relaxed);
+        info!("Stream loop closing peer connection");
+        if let Err(e) = pc.close().await {
+            error!("Stream loop peer_connection.close() error: {}", e);
+        }
     }
 }
 
 /// Build a WebRTC configuration with STUN servers.
+/// Falls back to a well-known public STUN server when none are configured,
+/// matching the viewer's behavior so both sides can generate srflx candidates
+/// for NAT traversal.
 fn build_configuration(stun_servers: &[String]) -> RTCConfiguration {
-    let ice_servers: Vec<RTCIceServer> = stun_servers
-        .iter()
-        .map(|url| RTCIceServer {
-            urls: vec![url.clone()],
+    let ice_servers: Vec<RTCIceServer> = if stun_servers.is_empty() {
+        vec![RTCIceServer {
+            urls: vec![frame::DEFAULT_STUN.into()],
             ..Default::default()
-        })
-        .collect();
+        }]
+    } else {
+        stun_servers
+            .iter()
+            .map(|url| RTCIceServer {
+                urls: vec![url.clone()],
+                ..Default::default()
+            })
+            .collect()
+    };
 
     RTCConfigurationBuilder::new()
         .with_ice_servers(ice_servers)
@@ -744,19 +820,18 @@ fn dispatch_key(data: &[u8], peer_id: &str) {
         CTRL_HELD.store(pressed, Ordering::Relaxed);
     }
 
-    // ── Ctrl+V → xclip + xdotool (Linux only) ──────────────────────────
-    #[cfg(target_os = "linux")]
+    // ── Ctrl+V → re-populate clipboard then forward key ─────────────────
+    // enigo cannot synthesise Ctrl+Unicode at the OS level on some platforms,
+    // so we ensure the clipboard still holds the last received text, then
+    // let enigo forward the Ctrl+V key combination normally.
     if pressed && key_code == VK_V && CTRL_HELD.load(Ordering::Relaxed) {
-        info!(
-            "[{}] Ctrl+V detected – delegating to xclip + xdotool",
-            peer_id
-        );
+        info!("[{}] Ctrl+V detected – ensuring clipboard is populated", peer_id);
         if let Ok(text) = LAST_RECEIVED_TEXT.lock() {
             if !text.is_empty() {
-                paste_text_via_xclip_xdotool(&text, peer_id);
+                set_clipboard_text(&text, peer_id);
             }
         }
-        return;
+        // Fall through: let enigo forward the key event normally
     }
 
     match ENIGO.lock() {
@@ -854,13 +929,33 @@ fn handle_clipboard_msg(data: &[u8], state: Option<ClipState>, peer_id: &str) ->
                 peer_id,
                 text.len()
             );
-            // Cache for Ctrl+V paste (enigo cannot combine Ctrl + Unicode).
+            // Cache for Ctrl+V paste.
             if let Ok(mut c) = LAST_RECEIVED_TEXT.lock() {
                 *c = text.clone();
             }
             set_clipboard_text(&text, peer_id);
             // Record hash so the writer thread won't echo this back to the viewer.
             if let Ok(mut sync) = CLIP_SYNC.lock() {
+                sync.last_received_hash = hash;
+            }
+            state
+        }
+        frame::CLIP_TAG_IMAGE => {
+            // Image clipboard from viewer: [width:u32le][height:u32le][rgba...]
+            if data.len() < 1 + frame::CLIP_IMAGE_HDR_SIZE {
+                warn!("[{}] Image clipboard msg too short: {} bytes", peer_id, data.len());
+                return state;
+            }
+            let width = u32::from_le_bytes(data[1..5].try_into().unwrap_or_default());
+            let height = u32::from_le_bytes(data[5..9].try_into().unwrap_or_default());
+            let rgba = &data[9..];
+            info!(
+                "[{}] clipboard image received from viewer: {}x{} ({} bytes)",
+                peer_id, width, height, rgba.len()
+            );
+            let hash = bytes_hash(rgba);
+            set_clipboard_image(rgba, width, height, peer_id);
+            if let Ok(mut sync) = CLIP_IMAGE_SYNC.lock() {
                 sync.last_received_hash = hash;
             }
             state
@@ -971,20 +1066,19 @@ fn handle_file_chunk(data: &[u8], state: Option<ClipState>, peer_id: &str) -> Op
     Some(s)
 }
 
-/// All chunks received — set clipboard and simulate Ctrl+V
+/// All chunks received — set clipboard to file URIs
 fn handle_transfer_complete(state: Option<ClipState>, peer_id: &str) {
     let s = match state {
         Some(s) => s,
         None => return,
     };
 
-    // Build file:// URI list for the clipboard
-    let uris: Vec<String> = s
+    // Build path list for clipboard-rs
+    let paths: Vec<String> = s
         .files
         .iter()
-        .map(|(path, _, _)| format!("file://{}", path.display()))
+        .map(|(path, _, _)| path.to_string_lossy().to_string())
         .collect();
-    let uri_text = uris.join("\n");
 
     info!(
         "[{}] Transfer complete: {} files in {}",
@@ -993,309 +1087,165 @@ fn handle_transfer_complete(state: Option<ClipState>, peer_id: &str) {
         s.dir.display()
     );
 
-    // Close file handles
-    std::mem::drop(s.files);
+    // Drop file handles before setting clipboard (avoids lock issues on Windows)
+    drop(s.files);
 
-    // Set clipboard using xclip (X11) or wl-copy (Wayland)
-    #[cfg(target_os = "linux")]
-    if set_clipboard_uris(&uri_text).is_err() && set_clipboard_wlcopy(&uri_text).is_err() {
-        warn!(
-            "[{}] Failed to set clipboard (neither xclip nor wl-copy available)",
-            peer_id
-        );
-        if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(&uri_text)) {
-            error!("[{}] arboard fallback set_text error: {}", peer_id, e);
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(&uri_text)) {
-            error!("[{}] arboard set_text error: {}", peer_id, e);
-        }
-    }
-
-    // Trigger paste via xdotool so the transferred files appear in the active window.
-    #[cfg(target_os = "linux")]
-    if let Ok(output) = Command::new("xdotool").args(["key", "ctrl+v"]).output() {
-        if output.status.success() {
-            info!("[{}] xdotool ctrl+v paste OK", peer_id);
-        } else {
-            warn!(
-                "[{}] xdotool paste failed: {}",
-                peer_id,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn set_clipboard_uris(uri_text: &str) -> Result<(), ()> {
-    let mut child = Command::new("xclip")
-        .args(["-selection", "clipboard", "-target", "text/uri-list", "-i"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            error!("xclip spawn error: {}", e);
-        })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        if let Err(e) = stdin.write_all(uri_text.as_bytes()) {
-            error!("xclip stdin write error: {}", e);
-        }
-    }
-    child.wait().map_err(|e| {
-        error!("xclip wait error: {}", e);
-    })?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn set_clipboard_wlcopy(uri_text: &str) -> Result<(), ()> {
-    let mut child = Command::new("wl-copy")
-        .args(["--type", "text/uri-list"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            error!("wl-copy spawn error: {}", e);
-        })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        if let Err(e) = stdin.write_all(uri_text.as_bytes()) {
-            error!("wl-copy stdin write error: {}", e);
-        }
-    }
-    child.wait().map_err(|e| {
-        error!("wl-copy wait error: {}", e);
-    })?;
-    Ok(())
-}
-
-/// Populate the X11 CLIPBOARD selection with `text` via `xclip` and
-/// immediately fire Ctrl+V via `xdotool`.  Called when the viewer sends
-/// Ctrl+V — enigo cannot express this combination, so we side-step it
-/// entirely with external X11 tools.
-#[cfg(target_os = "linux")]
-fn paste_text_via_xclip_xdotool(text: &str, peer_id: &str) {
-    // Step 1: set clipboard via xclip (spawn + wait for completion)
-    match Command::new("xclip")
-        .args(["-selection", "clipboard", "-i"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(mut child) => {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                if let Err(e) = stdin.write_all(text.as_bytes()) {
-                    error!("[{}] xclip stdin write error (paste): {}", peer_id, e);
-                }
-            }
-            match child.wait() {
-                Ok(status) if status.success() => {
-                    info!(
-                        "[{}] xclip set clipboard OK ({} bytes)",
-                        peer_id,
-                        text.len()
-                    );
-                }
-                Ok(status) => {
-                    warn!("[{}] xclip exited with {:?}", peer_id, status);
-                    return;
-                }
+    match ClipboardContext::new() {
+        Ok(ctx) => {
+            match ctx.set_files(paths.clone()) {
+                Ok(()) => info!("[{}] Clipboard files set ({} items)", peer_id, paths.len()),
                 Err(e) => {
-                    warn!("[{}] xclip wait failed: {}", peer_id, e);
-                    return;
+                    warn!("[{}] set_files failed: {} — falling back to URI text", peer_id, e);
+                    // Fallback: set as plain URI text
+                    let uri_text = paths.iter()
+                        .map(|p| format!("file://{p}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if let Err(e2) = ctx.set_text(uri_text) {
+                        error!("[{}] set_text fallback error: {}", peer_id, e2);
+                    }
                 }
             }
         }
-        Err(e) => {
-            warn!("[{}] xclip not available: {}", peer_id, e);
+        Err(e) => error!("[{}] clipboard context error: {}", peer_id, e),
+    }
+}
+
+/// Set the system clipboard to plain text via clipboard-rs.
+fn set_clipboard_text(text: &str, peer_id: &str) {
+    match ClipboardContext::new() {
+        Ok(ctx) => match ctx.set_text(text.to_owned()) {
+            Ok(()) => info!("[{}] Clipboard text set ({} bytes)", peer_id, text.len()),
+            Err(e) => error!("[{}] set_text error: {}", peer_id, e),
+        },
+        Err(e) => error!("[{}] clipboard context error: {}", peer_id, e),
+    }
+}
+
+/// Set the system clipboard to an RGBA image via clipboard-rs.
+fn set_clipboard_image(rgba: &[u8], width: u32, height: u32, peer_id: &str) {
+    let rgba_img = match image::RgbaImage::from_raw(width, height, rgba.to_vec()) {
+        Some(img) => img,
+        None => {
+            error!("[{}] failed to create RgbaImage from raw data", peer_id);
             return;
         }
-    }
-
-    // Step 2: fire paste via xdotool
-    match Command::new("xdotool")
-        .args(["key", "--clearmodifiers", "ctrl+v"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            info!("[{}] xdotool ctrl+v paste OK", peer_id);
-        }
-        Ok(output) => {
-            warn!(
-                "[{}] xdotool paste failed: {}",
-                peer_id,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(e) => warn!("[{}] xdotool not available: {}", peer_id, e),
-    }
-}
-
-/// Set the system clipboard to plain text.  Prefers `xclip` on Linux (more
-/// reliable for Ctrl+V via xdotool), then `arboard`, then `wl-copy`.
-fn set_clipboard_text(text: &str, peer_id: &str) {
-    // Linux: prefer xclip (avoids arboard's X11 clipboard-manager timeout issue)
-    #[cfg(target_os = "linux")]
-    if let Ok(mut child) = Command::new("xclip")
-        .args(["-selection", "clipboard", "-i"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        use std::io::Write;
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(text.as_bytes()) {
-                error!("[{}] xclip stdin write error: {}", peer_id, e);
-            }
-        }
-        match child.wait() {
-            Ok(status) if status.success() => {
-                info!(
-                    "[{}] Clipboard text set via xclip ({} bytes)",
-                    peer_id,
-                    text.len()
-                );
-                return;
-            }
-            Ok(status) => warn!("[{}] xclip exit: {:?}", peer_id, status),
-            Err(e) => warn!("[{}] xclip wait: {}", peer_id, e),
-        }
-    }
-
-    // Cross-platform: arboard
-    if arboard::Clipboard::new()
-        .and_then(|mut c| c.set_text(text))
-        .is_ok()
-    {
-        info!("[{}] Clipboard text set via arboard", peer_id);
-        return;
-    }
-
-    // Linux fallback: wl-copy
-    #[cfg(target_os = "linux")]
-    if let Ok(mut child) = Command::new("wl-copy")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        use std::io::Write;
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(text.as_bytes()) {
-                error!("[{}] wl-copy stdin write error: {}", peer_id, e);
-            }
-        }
-        if let Err(e) = child.wait() {
-            error!("[{}] wl-copy wait error: {}", peer_id, e);
-        }
+    };
+    let img = RustImageData::from_dynamic_image(
+        image::DynamicImage::ImageRgba8(rgba_img),
+    );
+    match ClipboardContext::new() {
+        Ok(ctx) => match ctx.set_image(img) {
+            Ok(()) => info!("[{}] Clipboard image set ({}x{})", peer_id, width, height),
+            Err(e) => error!("[{}] set_image error: {}", peer_id, e),
+        },
+        Err(e) => error!("[{}] clipboard context error: {}", peer_id, e),
     }
 }
 
 /// Periodically monitor the host's system clipboard and push changes to the viewer.
 ///
-/// Uses hash-based loop prevention: when text is received from the viewer and written
-/// to the local clipboard, we record its hash in `CLIP_SYNC`.  On the next poll we
-/// compare the current clipboard hash against the recorded one; a match means the
-/// change was our own echo, so we skip pushing it back.
+/// Uses hash-based loop prevention: when content is received from the viewer and written
+/// to the local clipboard, we record its hash so the writer can skip echoing it back.
 ///
-/// Poll interval is 200 ms — short enough that a Ctrl+V key event forwarded by the
-/// viewer (which takes a few ms at most) will arrive *after* the clipboard has been
-/// populated on the host side.  This is the RustDesk model: keep the clipboard always
-/// in sync and let normal keyboard forwarding handle paste.
+/// Monitors: text, file-list, and image clipboards.
 pub fn spawn_clipboard_writer(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>, peer_id: String) {
     tokio::spawn(async move {
         info!("[{}] Clipboard writer started (200ms poll)", peer_id);
         let mut last_text = String::new();
         let mut last_file_uris = String::new();
+        let mut last_image_hash: u64 = 0;
         while running.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(frame::CLIPBOARD_WRITE_POLL_MS)).await;
 
+            let ctx = match ClipboardContext::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("[{}] clipboard context error: {}", peer_id, e);
+                    continue;
+                }
+            };
+
             // ── Check text clipboard ─────────────────
-            if let Ok(mut c) = arboard::Clipboard::new() {
-                if let Ok(text) = c.get_text() {
-                    if !text.is_empty() && text != last_text {
-                        let hash = text_hash(&text);
-                        // Suppress echo — skip if this matches text we just
-                        // received from the viewer.
-                        let should_send = {
-                            match CLIP_SYNC.lock() {
-                                Ok(sync) => hash != sync.last_received_hash,
-                                Err(_) => true,
-                            }
-                        };
-                        if should_send {
-                            let mut payload = vec![frame::CLIP_TAG_TEXT];
-                            payload.extend_from_slice(text.as_bytes());
-                            if dc.send(BytesMut::from(&payload[..])).await.is_ok() {
-                                info!("[{}] Sent clipboard text ({} bytes)", peer_id, text.len());
-                                last_text = text;
-                            }
-                        } else {
-                            // Echo suppressed — update last_text to avoid
-                            // re-detecting on the next poll.
-                            last_text = text;
+            if let Ok(text) = ctx.get_text() {
+                if !text.is_empty() && text != last_text {
+                    let hash = text_hash(&text);
+                    let should_send = match CLIP_SYNC.lock() {
+                        Ok(sync) => hash != sync.last_received_hash,
+                        Err(_) => true,
+                    };
+                    if should_send {
+                        let mut payload = vec![frame::CLIP_TAG_TEXT];
+                        payload.extend_from_slice(text.as_bytes());
+                        if dc.send(BytesMut::from(&payload[..])).await.is_ok() {
+                            info!("[{}] Sent clipboard text ({} bytes)", peer_id, text.len());
                         }
                     }
+                    last_text = text;
                 }
             }
 
-            // ── Check file URI clipboard ────────────
-            #[cfg(target_os = "linux")]
-            if let Some(uris) = get_clipboard_file_uris() {
+            // ── Check file URI clipboard ─────────────
+            if let Some(uris) = get_clipboard_file_uris(&ctx) {
                 if !uris.is_empty() && uris != last_file_uris {
                     send_host_clipboard_files(&dc, &uris, &peer_id, &mut last_file_uris).await;
                 }
             }
-            // Suppress unused variable warnings on non-Linux
-            #[cfg(not(target_os = "linux"))]
-            let _ = &last_file_uris;
+
+            // ── Check image clipboard ────────────────
+            if let Ok(img) = ctx.get_image() {
+                let rgba = match img.to_rgba8() {
+                    Ok(rgba_img) => rgba_img.into_raw(),
+                    Err(_) => continue,
+                };
+                if !rgba.is_empty() {
+                    let h = bytes_hash(&rgba);
+                    let should_send = {
+                        let echo = match CLIP_IMAGE_SYNC.lock() {
+                            Ok(sync) => h == sync.last_received_hash,
+                            Err(_) => false,
+                        };
+                        h != last_image_hash && !echo
+                    };
+                    if should_send {
+                        let (width, height) = img.get_size();
+                        if rgba.len() <= frame::CLIP_IMAGE_MAX_BYTES {
+                            let mut payload = Vec::with_capacity(1 + 8 + rgba.len());
+                            payload.push(frame::CLIP_TAG_IMAGE);
+                            payload.extend_from_slice(&(width as u32).to_le_bytes());
+                            payload.extend_from_slice(&(height as u32).to_le_bytes());
+                            payload.extend_from_slice(&rgba);
+                            if dc.send(BytesMut::from(&payload[..])).await.is_ok() {
+                                info!("[{}] Sent clipboard image: {}x{} ({} bytes)",
+                                      peer_id, width, height, rgba.len());
+                            }
+                        } else {
+                            warn!("[{}] Clipboard image too large ({} bytes), skipping",
+                                  peer_id, rgba.len());
+                        }
+                        last_image_hash = h;
+                    }
+                }
+            }
         }
         info!("[{}] Clipboard writer ended", peer_id);
     });
 }
 
-/// Read file:// URIs from the clipboard using xclip or wl-paste.
-#[cfg(target_os = "linux")]
-fn get_clipboard_file_uris() -> Option<String> {
-    // Try xclip (X11)
-    if let Ok(out) = Command::new("xclip")
-        .args(["-selection", "clipboard", "-target", "text/uri-list", "-o"])
-        .output()
-    {
-        if out.status.success() && !out.stdout.is_empty() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if s.starts_with("file://") {
-                return Some(s);
-            }
-        }
+/// Read file paths from the system clipboard via clipboard-rs.
+/// Returns a newline-separated `file://` URI string, or `None`.
+fn get_clipboard_file_uris(ctx: &ClipboardContext) -> Option<String> {
+    let files = ctx.get_files().ok()?;
+    if files.is_empty() {
+        return None;
     }
-    // Try wl-paste (Wayland)
-    if let Ok(out) = Command::new("wl-paste")
-        .args(["--type", "text/uri-list"])
-        .output()
-    {
-        if out.status.success() && !out.stdout.is_empty() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if s.starts_with("file://") {
-                return Some(s);
-            }
-        }
-    }
-    None
+    let uris: Vec<String> = files.into_iter().map(|p| {
+        if p.starts_with("file://") { p } else { format!("file://{p}") }
+    }).collect();
+    Some(uris.join("\n"))
 }
 
 /// Package and send files from the host clipboard to the viewer.
-#[cfg(target_os = "linux")]
 async fn send_host_clipboard_files(
     dc: &Arc<dyn DataChannel>,
     uris: &str,
@@ -1304,16 +1254,15 @@ async fn send_host_clipboard_files(
 ) {
     let chunk_size = frame::FILE_CHUNK_SIZE;
 
-    // Parse URIs, strip file:// prefix
-    let paths: Vec<std::path::PathBuf> = uris
+    // Parse URIs → local paths
+    let paths: Vec<PathBuf> = uris
         .lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.starts_with("file://") {
-                // URL-decode the path (basic: just strip prefix and convert to path)
-                let raw = &line[7..];
-                // Handle percent-encoded characters minimally
-                Some(std::path::PathBuf::from(raw))
+                Some(PathBuf::from(&line[7..]))
+            } else if !line.is_empty() {
+                Some(PathBuf::from(line))
             } else {
                 None
             }
@@ -1326,12 +1275,9 @@ async fn send_host_clipboard_files(
     // Build file list header: [0x03][count:u16le] + for each: [name_len:u16le][name:utf8][size:u64le]
     let mut list_buf = Vec::with_capacity(frame::CLIP_FILE_LIST_BUF);
     list_buf.push(frame::CLIP_TAG_FILE_LIST);
-    let count = paths.len() as u16;
-    list_buf.extend_from_slice(&count.to_le_bytes());
-
+    list_buf.extend_from_slice(&(paths.len() as u16).to_le_bytes());
     for p in &paths {
-        let name = p
-            .file_name()
+        let name = p.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("file_{}", list_buf.len()));
         let name_bytes = name.as_bytes();
@@ -1376,10 +1322,6 @@ async fn send_host_clipboard_files(
     if let Err(e) = dc.send(BytesMut::from(&[frame::CLIP_TAG_DONE][..])).await {
         error!("[{}] Failed to send clipboard done marker: {}", peer_id, e);
     }
-    info!(
-        "[{}] Sent {} host clipboard files to viewer",
-        peer_id,
-        paths.len()
-    );
+    info!("[{}] Sent {} host clipboard files to viewer", peer_id, paths.len());
     *last_file_uris = uris.to_string();
 }

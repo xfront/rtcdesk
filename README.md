@@ -5,54 +5,59 @@ RTCDesk 是一款使用 Rust 编写的开源远程桌面工具，基于 WebRTC �
 ## 整体架构
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        RTCDesk 架构                              │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────┐   信令 (WebSocket)    ┌──────────────────┐     │
-│  │  Host 端    │◄─────────────────────►│  信令服务器       │     │
-│  │ (main.rs)   │   JSON 消息转发       │  (server.rs)     │     │
-│  │             │                      │  axum + WS       │     │
-│  │ • 屏幕捕获   │                      └────────┬─────────┘     │
-│  │ • WebRTC    │   信令 (WebSocket)             │               │
-│  │ • 输入模拟   │◄───────────────────────────────┘               │
-│  │ • 剪贴板    │                                                │
-│  └──────┬──────┘                                                │
-│         │ WebRTC DataChannel                                     │
-│         │  "desktop"   — JPEG 帧 (分片传输)                       │
-│         │  "input"     — 鼠标 / 键盘 / 滚轮事件                   │
-│         │  "clipboard" — 文本 / 文件同步                          │
-│         ▼                                                        │
-│  ┌─────────────┐                                                 │
-│  │  Viewer 端  │  Dioxus Desktop GUI                             │
-│  │ (client.rs) │  • 连接表单 + 远程视图                           │
-│  │ (viewer.rs) │  • 浮动工具栏 (画质 / 缩放 / 剪贴板 / 全屏)      │
-│  │             │  • 帧重组 & Base64 渲染                          │
-│  │             │  • 输入事件转发                                   │
-│  │             │  • 剪贴板自动双向同步                              │
-│  └─────────────┘                                                 │
-│                                                                  │
-│  共享模块:                                                        │
-│  • frame.rs  — 帧分片协议、常量、FrameAssembler                   │
-│  • signal.rs — 信令消息类型、SDP 参数编解码                         │
-│  • capture.rs — 屏幕截图 + JPEG 编码 (Host 专用)                   │
-│  • peer.rs   — WebRTC PeerConnection 管理 (Host 专用)             │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          RTCDesk 架构 (Workspace)                        │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌───────────────────┐          WebSocket            ┌────────────────┐  │
+│  │   host-service    │◄──────────────────────────────►│ signaling-     │  │
+│  │   (Host 端)       │   JSON 信令 + JWT 认证        │ server         │  │
+│  │                   │                               │ (axum + WS)    │  │
+│  │  • 屏幕捕获/编码   │                               │                │  │
+│  │  • WebRTC Peer    │                               │  • 信令转发     │  │
+│  │  • 输入模拟       │                               │  • JWT 认证     │  │
+│  │  • 剪贴板同步     │          WebSocket            │  • SQLite 存储  │  │
+│  └────────┬──────────┘◄──────────────────────────────┤  • 心跳/在线    │  │
+│           │                                        ──┤                │  │
+│           │  WebRTC DataChannel (P2P)               │  └────────────────┘  │
+│           │  "desktop"   — JPEG 帧 (分片传输)        │                      │
+│           │  "input"     — 鼠标 / 键盘 / 滚轮        │                      │
+│           │  "clipboard" — 文本 / 文件同步           │                      │
+│           ▼                                         │                      │
+│  ┌───────────────────┐                              │                      │
+│  │   client (Viewer) │  Dioxus Desktop GUI           │                      │
+│  │                   │  • 自定义标题栏 + 侧边栏       │                      │
+│  │  • 连接管理       │  • 远程视图 (三种缩放模式)     │                      │
+│  │  • 远程视图       │  • 浮动工具栏                 │                      │
+│  │  • 输入转发       │  • 暗色 / 亮色主题            │                      │
+│  │  • 文件传输       │  • 窗口边缘拖拽缩放            │                      │
+│  │  • 截图           │  • 连接历史                   │                      │
+│  └───────────────────┘                              │                      │
+│                                                                          │
+│  ┌───────────────────┐                                                    │
+│  │   shared          │  共享模块：帧协议、信令消息、JWT 类型、本地 ID      │
+│  └───────────────────┘                                                    │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 连接流程
 
-1. **注册** — Host 和 Viewer 分别连接信令服务器，注册自己的 Peer ID
-2. **发起连接** — Viewer 发送 `RequestConnect`，服务器转发给 Host
-3. **SDP 协商** — Host 创建 Offer（含 DataChannel），Viewer 创建 Answer（注入画质参数到 SDP）
-4. **ICE 穿透** — 双方通过信令服务器交换 ICE Candidates，尝试建立 P2P 连接
-5. **流传输** — WebRTC P2P 连接建立后，桌面流通过 DataChannel 传输，不再经过信令服务器
+1. **启动 signaling-server** — 独立信令服务，管理用户认证和消息转发
+2. **Host 登录注册** — host-service 启动后连接信令服务器，JWT 认证，注册机器信息
+3. **Viewer 登录** — client 连接信令服务器，JWT 认证，获取在线机器列表
+4. **发起连接** — Viewer 选择目标机器发起 `RequestConnect`
+5. **SDP 协商** — Host 创建 Offer（含 DataChannel），Viewer 创建 Answer（注入画质参数）
+6. **ICE 穿透** — 双方通过信令服务器交换 ICE Candidates，建立 P2P 连接
+7. **流传输** — WebRTC P2P 连接建立后，桌面流通过 DataChannel 传输，不再经过信令服务器
 
 ```
- Viewer                        信令服务器                        Host
+ Viewer (client)               signaling-server               Host (host-service)
    │                              │                              │
-   │── Register ─────────────────►│◄── Register ─────────────────│
-   │                              │                              │
+   │── Login ────────────────────►│◄── Login ────────────────────│
+   │◄── JWT Token ───────────────│── JWT Token ────────────────►│
+   │── Register(Viewer) ─────────►│◄── Register(Host) ───────────│
+   │                              │◄── Heartbeat (每30s) ────────│
+   │── MachineList ──────────────►│── MachineList ──────────────►│
    │── RequestConnect ───────────►│── RequestConnect ───────────►│
    │                              │                              │
    │◄────────────── Offer ◄───────│◄─────── Offer ───────────────│
@@ -66,66 +71,117 @@ RTCDesk 是一款使用 Rust 编写的开源远程桌面工具，基于 WebRTC �
    │═══════════ 剪贴板 ("clipboard" channel, 双向) ══════════════│
 ```
 
-## 模块说明
+## 项目结构
 
-### `main.rs` — Host 入口
+```
+rtcdesk/
+├── Cargo.toml                  # Workspace 配置
+├── client/                     # Viewer GUI 应用
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs             # 应用入口 + 窗口管理
+│       ├── viewer.rs           # WebRTC 连接管理 + 帧接收
+│       ├── quality.rs          # 画质预设 + 缩放模式定义
+│       ├── theme.rs            # 暗色/亮色主题定义
+│       ├── config.rs           # 配置持久化 + 连接历史
+│       ├── clipboard.rs        # 剪贴板同步逻辑
+│       ├── screenshot.rs       # 远程截图功能
+│       ├── toast.rs            # Toast 通知组件
+│       ├── host_process.rs     # Host 进程管理
+│       ├── components/         # UI 组件
+│       │   ├── auth.rs         # 登录/注册表单
+│       │   ├── connect.rs      # 连接设置页
+│       │   ├── home.rs         # 主页 (机器列表)
+│       │   ├── host.rs         # Host 模式页
+│       │   ├── settings.rs     # 设置页
+│       │   ├── sidebar.rs      # 侧边栏导航
+│       │   ├── titlebar.rs     # 自定义标题栏 (含主题切换)
+│       │   └── resize.rs       # 窗口边缘拖拽缩放
+│       ├── remote/             # 远程会话模块
+│       │   ├── mod.rs          # RemoteView 状态管理
+│       │   ├── view.rs         # 远程视图渲染 + 全屏
+│       │   ├── toolbar.rs      # 浮动工具栏
+│       │   ├── mouse.rs        # 鼠标坐标映射 + 事件处理
+│       │   ├── keyboard.rs     # 键盘事件捕获
+│       │   ├── file_transfer.rs # 文件传输 UI
+│       │   └── viewer_loop.rs  # Viewer 主循环 (帧接收/分发)
+│       └── assets/
+│           └── app.css         # 全局样式 (暗色/亮色双主题)
+├── host-service/               # Host 端服务
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs             # 入口：登录、注册机器、主循环
+│       ├── signal_client.rs    # 信令 WS 客户端 (登录、心跳、消息收发)
+│       ├── peer.rs             # WebRTC PeerConnection 管理
+│       └── capture.rs          # 屏幕捕获与 JPEG 编码
+├── signaling-server/           # 信令服务器
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs             # 入口：axum HTTP/WS 服务
+│       ├── ws_handler.rs       # WebSocket 信令处理
+│       ├── auth.rs             # JWT 签发/验证 + 用户注册/登录
+│       ├── db.rs               # SQLite 数据访问层
+│       └── machine.rs          # 机器注册、心跳、在线状态
+├── shared/                     # 共享协议与类型
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs
+│       ├── frame.rs            # 帧分片协议 + FrameAssembler
+│       ├── signal.rs           # 信令消息枚举定义
+│       ├── auth.rs             # JWT Claims 类型
+│       └── local_id.rs         # 本地设备 ID 生成
+├── tools/                      # 辅助工具
+│   ├── Cargo.toml
+│   └── src/
+│       └── stuncheck.rs        # STUN 服务器连通性检查
+└── stunlist.txt                # 公共 STUN 服务器列表
+```
 
-- 启动内置信令服务器 (`axum` + WebSocket)
-- 以 Host 身份连接信令服务器
-- 创建 `RtcPeer` 响应 Viewer 的连接请求
-- 管理 WebRTC SDP 协商和 ICE 候选交换
-- 启动屏幕捕获和帧推送
+## 功能特性
 
-### `client.rs` — Viewer GUI
+### Viewer (client)
 
-Dioxus Desktop 应用，提供全功能的远程桌面查看器：
+- **自定义标题栏** — 无边框窗口，包含窗口控制按钮和主题切换
+- **侧边栏导航** — 连接、Host 模式、设置
+- **连接管理** — 填写服务器地址、远程设备 ID、画质预设；连接历史记录
+- **三种缩放模式**
+  - `Fit` — 自适应（保持宽高比，完整显示）
+  - `Stretch` — 拉伸填充（填满整个视口）
+  - `Original` — 原始大小（1:1 像素，超出出现滚动条）
+- **浮动工具栏** — 自动隐藏，支持：
+  - 画质切换（4 档：最佳画质 / 均衡 / 流畅优先 / 低带宽）
+  - 缩放模式切换
+  - 只看模式（仅观看，不发送输入）
+  - 截图
+  - 文件发送
+  - 剪贴板同步
+  - 全屏 / 最小化 / 断开连接
+- **暗色 / 亮色主题** — 完整的双主题支持，工具栏和所有 UI 适配
+- **窗口边缘拖拽缩放** — 自定义无边框窗口的拉伸支持
+- **文件传输** — 基于 DataChannel 的文件收发
+- **远程截图** — 保存远程桌面截图到本地
 
-- **连接表单** — 填写服务器地址、远程设备 ID、选择画质预设
-- **远程视图** — Base64 JPEG 渲染 + 鼠标/键盘事件捕捉 + 坐标转换
-- **浮动工具栏** — Remmina 风格，支持画质切换、缩放模式、剪贴板同步、全屏、断开连接
-- **ScaleMode** — `Fit`（自适应）、`Stretch`（拉伸填充）、`Original`（原始大小 + 滚动条）
-- **画质预设** — 4 档（最佳画质 / 均衡 / 流畅优先 / 低带宽），每档配置分辨率、JPEG 质量、FPS、码率
-- **剪贴板自动同步** — 200ms 轮询本地剪贴板，hash 去重防回环
+### Host (host-service)
 
-### `viewer.rs` — Viewer 网络层
+- 屏幕捕获与 JPEG 编码（`xcap`）
+- WebRTC PeerConnection 管理（Offer/Answer 协商）
+- 帧分片推送（"desktop" channel）
+- 输入事件接收与模拟（`enigo`）
+- 剪贴板双向同步
+- 动态画质调整（响应 Viewer 切换）
+- JWT 认证 + 心跳保持
 
-`RtcViewer` 封装 Viewer 端的 WebRTC 连接：
+### Signaling Server
 
-- WebSocket 信令客户端（注册、连接请求、ICE 转发）
-- WebRTC PeerConnection 管理
-- 帧重组（`FrameAssembler`）
-- 输入事件编码发送
-- 剪贴板数据收发
+- JWT 用户认证（注册/登录/token 刷新）
+- 信令消息转发（Offer/Answer/ICE）
+- SQLite 用户与机器数据存储
+- 机器在线状态管理（心跳超时 90s）
+- 房间事件广播
 
-### `peer.rs` — Host 网络层
+## 协议格式
 
-`RtcPeer` 封装 Host 端的 WebRTC 连接：
-
-- PeerConnection 管理 + SDP 协商
-- 帧捕获循环 → 分片 → "desktop" DataChannel 推送
-- 接收 Viewer 输入 → `enigo` 模拟鼠标/键盘/滚轮
-- 剪贴板双向同步（文本 + 文件传输）
-- 动态画质调整（运行时响应 Viewer 的画质切换）
-
-### `server.rs` — 信令服务器
-
-基于 `axum` + WebSocket 的轻量信令服务器：
-
-- Peer 注册表 (HashMap)
-- 消息转发（Offer/Answer/ICE/QualityUpdate）
-- 房间事件广播（PeerJoined/PeerLeft）
-- 内嵌于 Host 进程中运行
-
-### `capture.rs` — 屏幕捕获
-
-- 使用 `xcap` 库进行桌面截图
-- RGBA → RGB → JPEG 编码（可调质量 0-100）
-- 按需缩放（Lanczos3 滤波，保持宽高比）
-- 返回 `CapturedFrame`：原始分辨率 + 缩放后分辨率 + JPEG 数据
-
-### `frame.rs` — 协议定义
-
-**帧分片格式：**
+### 帧分片
 
 ```
 ┌────────────┬────────────┬───────────────┬──────────────────┐
@@ -134,7 +190,7 @@ Dioxus Desktop 应用，提供全功能的远程桌面查看器：
 └────────────┴────────────┴───────────────┴──────────────────┘
 ```
 
-**帧头格式（16 字节）：**
+### 帧头 (16 字节)
 
 ```
 ┌─────────┬─────────┬──────────┬──────────┬──────────────────┐
@@ -143,10 +199,10 @@ Dioxus Desktop 应用，提供全功能的远程桌面查看器：
 └─────────┴─────────┴──────────┴──────────┴──────────────────┘
 ```
 
-- `orig_w` / `orig_h` — 远程显示器实际分辨率（用于鼠标坐标映射）
-- `frame_w` / `frame_h` — 缩放后的 JPEG 尺寸（可能小于 orig，节省带宽）
+- `orig_w / orig_h` — 远程显示器实际分辨率（鼠标坐标映射）
+- `frame_w / frame_h` — JPEG 尺寸（可能缩放以节省带宽）
 
-**输入事件格式：**
+### 输入事件
 
 | 类型 | 格式 |
 |------|------|
@@ -154,7 +210,7 @@ Dioxus Desktop 应用，提供全功能的远程桌面查看器：
 | 键盘 | `0x02` + key_code(u32 LE) + pressed(u8) |
 | 滚轮 | `0x03` + dx(i32 LE) + dy(i32 LE) |
 
-**剪贴板格式：**
+### 剪贴板
 
 | 标签 | 含义 |
 |------|------|
@@ -163,97 +219,91 @@ Dioxus Desktop 应用，提供全功能的远程桌面查看器：
 | `0x04` | 文件数据块 (64 KiB) |
 | `0x05` | 传输完成 |
 
-### `signal.rs` — 信令协议
+### 信令消息 (JSON, serde tag="type")
 
-JSON 格式的信令消息（`serde` tag="type"）：
-
-- `Register` / `Registered` / `PeerJoined` / `PeerLeft` — 会话管理
+- `Login` / `LoginResult` — JWT 认证
+- `Register` / `Registered` — Peer 注册
+- `MachineRegister` / `MachineStatus` — 机器注册与在线状态
+- `Heartbeat` — 心跳（30s 间隔）
+- `TokenRefresh` / `TokenRefreshResult` — Token 刷新
 - `Offer` / `Answer` / `IceCandidate` — WebRTC SDP 协商
-- `RequestConnect` / `ConnectRequest` — 连接请求
-- `QualityUpdate` — 动态画质调整（quality / max_dim / fps）
-- `Input` — 输入事件转发（备用路径，通常走 DataChannel）
+- `RequestConnect` / `ConnectRequest` / `AuthResult` — 连接请求与认证
+- `QualityUpdate` — 动态画质调整
+- `PeerJoined` / `PeerLeft` — 房间事件
 - `Error` — 错误消息
-
-SDP 参数编码：Viewer 的画质参数通过 `a=rtcdesk-*` SDP 属性行注入 Answer，Host 端从 SDP 中提取。
 
 ## 坐标映射管线
 
-Viewer 端鼠标坐标需经过两步转换后才能发送给 Host：
+Viewer 端鼠标坐标需经过两步转换：
 
 ```
- element pixel  ──[ScaleMode]──▶  frame pixel  ──[orig/frame 比例]──▶  远程屏幕坐标
+element pixel  ──[ScaleMode]──▶  frame pixel  ──[orig/frame 比例]──▶  远程屏幕坐标
 ```
 
-**举例：** 远程 1920×1080 屏幕，"均衡"画质发送 1280×720 帧，点击窗口中心：
+**举例：** 远程 1920×1080，"均衡"画质发送 1280×720，点击中心：
 
 - Frame 坐标: (640, 360)
-- 远程坐标: (640×1.5, 360×1.5) = **(960, 540)** ✓
+- 远程坐标: (640×1.5, 360×1.5) = **(960, 540)**
 
-三种 ScaleMode 均经过此管线正确映射。
+三种 ScaleMode 均正确映射。Original 模式下 viewport div 尺寸 = 帧像素，1:1 精确对应。
 
 ## 构建运行
 
 ### 依赖
 
-- Rust 1.85+
+- Rust 1.85+ (edition 2024)
 - Linux: X11 开发库 (`libxcb`, `libxrandr` 等)
-- 可选: `xclip`, `xdotool`（Host 端剪贴板粘贴支持）
+- 可选: `xclip`, `xdotool`（Host 端剪贴板粘贴）
 
 ### 构建
 
 ```bash
+# 构建所有 crate
 cargo build --release
+
+# 单独构建
+cargo build --release -p rtcdesk-client
+cargo build --release -p host-service
+cargo build --release -p signaling-server
+```
+
+### 运行信令服务器
+
+```bash
+cargo run --release -p signaling-server
+
+# 自定义地址
+RTCDESK_ADDR=0.0.0.0:9009 cargo run --release -p signaling-server
 ```
 
 ### 运行 Host
 
 ```bash
-# 默认 STUN 服务器
-cargo run --release
-
-# 自定义 STUN
-RTCDESK_STUN=stun:your-server.com:3478 cargo run --release
+cargo run --release -p host-service -- --server ws://localhost:9009/ws --username admin --password admin
 ```
 
 ### 运行 Viewer
 
 ```bash
-cargo run --release --bin client
+cargo run --release -p rtcdesk-client
 ```
 
 ## 技术栈
 
 | 组件 | 技术 |
 |------|------|
-| 语言 | Rust 2024 |
+| 语言 | Rust 2024 edition |
 | WebRTC | webrtc-rs 0.20.0-alpha |
-| 信令 | axum + tokio-tungstenite |
-| GUI | Dioxus Desktop (系统 WebView) |
-| 屏幕捕获 | xcap + image (JPEG 编码) |
-| 输入模拟 | enigo |
-| 剪贴板 | arboard |
+| 信令 | axum 0.8 + tokio-tungstenite |
+| GUI | Dioxus 0.7 Desktop (系统 WebView) |
+| 屏幕捕获 | xcap 0.9 + image 0.25 |
+| 输入模拟 | enigo 0.6 |
+| 剪贴板 | clipboard-rs 0.2 |
 | 加密 | rustls (aws-lc-rs) |
 | 序列化 | serde + serde_json |
+| 数据库 | rusqlite 0.31 (SQLite) |
+| 认证 | jsonwebtoken 9 + argon2 0.5 |
 | 运行时 | tokio |
-
-## 项目结构
-
-```
-RtcDesk/
-├── Cargo.toml          # 项目配置，三个二进制目标
-├── src/
-│   ├── main.rs         # Host 入口
-│   ├── client.rs       # Viewer GUI (Dioxus Desktop)
-│   ├── viewer.rs       # Viewer WebRTC 连接管理
-│   ├── peer.rs         # Host WebRTC 连接管理
-│   ├── server.rs       # WebSocket 信令服务器
-│   ├── capture.rs      # 屏幕捕获与 JPEG 编码
-│   ├── frame.rs        # 帧分片协议、常量、FrameAssembler
-│   └── signal.rs       # 信令消息类型定义
-├── assets/             # GUI 资源 (CSS, 图标)
-├── stunlist.txt        # 公共 STUN 服务器列表
-└── target/             # 编译输出
-```
 
 ## License
 

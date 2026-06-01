@@ -32,6 +32,11 @@ pub trait ViewerCallback: Send + Sync {
     /// Called when the remote host sent file URIs (newline-separated file:// URIs)
     /// after a complete file transfer.
     fn on_clipboard_file_uris(&self, uris: String);
+    /// Called when the remote host sent an image clipboard payload.
+    /// `rgba` is raw RGBA pixel data, `width`×`height` in pixels.
+    fn on_clipboard_image(&self, _rgba: Vec<u8>, _width: u32, _height: u32) {}
+    /// 周期性调用，提供更新的连接统计信息。
+    fn on_stats_update(&self, _stats: crate::remote::viewer_loop::ConnectionStats) {}
 }
 
 /// Discover local IP addresses for ICE host candidates.
@@ -120,7 +125,7 @@ impl RtcViewer {
         }
     }
 
-    pub async fn connect(&mut self, server_addr: String, stun_servers: Vec<String>) -> Result<()> {
+    pub async fn connect(&mut self, server_addr: String, stun_servers: Vec<String>, password: String) -> Result<()> {
         let (ws_write, ws_read) = Self::connect_to_signaling(&server_addr, &self.viewer_id).await?;
 
         let (ice_tx, ice_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -139,13 +144,15 @@ impl RtcViewer {
 
         *self.ws_write.lock().await = Some(ws_write);
 
-        // Send connection request to signaling server
-        let req = SignalMessage::RequestConnect {
+        // Send connection request to signaling server (with password)
+        let req = SignalMessage::ConnectRequest {
             from: self.viewer_id.clone(),
             target_id: self.host_id.clone(),
+            pic_quality: self.pic_quality,
+            password,
         };
         self.send_signaling_message(&req).await?;
-        info!("[{}] RequestConnect -> {}", self.viewer_id, self.host_id);
+        info!("[{}] ConnectRequest -> {} (quality={})", self.viewer_id, self.host_id, self.pic_quality);
 
         // Spawn ICE candidate forwarder
         spawn_ice_forwarder(ice_rx, self.host_id.clone(), self.ws_write.clone());
@@ -300,6 +307,15 @@ impl RtcViewer {
                 error!("[Viewer] disconnect close error: {}", e);
             }
         }
+        // Close the WebSocket writer so the signaling server detects
+        // the disconnection and removes this peer from the registry.
+        // Without this, the old WS stays open and the server never
+        // sends PeerLeft to the host, blocking reconnection.
+        let mut ws = self.ws_write.lock().await;
+        if let Some(w) = ws.take() {
+            drop(w); // explicitly drop to trigger WS close
+        }
+        self.ws_disconnected.notify_one();
     }
 
     // ── Private helpers for connect() ─────────────────────────────
@@ -316,12 +332,67 @@ impl RtcViewer {
         >,
     )> {
         use futures_util::{SinkExt, StreamExt};
+
+        // Load credentials from config
+        let cfg = crate::config::load_config();
+        let username = cfg.login_username.clone();
+        let password = cfg.login_password.clone();
+
         let ws_url = format!("ws://{}/ws", server_addr);
         info!("[{}] Connecting to {}", viewer_id, ws_url);
         let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .context("failed to connect to signaling server")?;
-        let (mut ws_write, ws_read) = ws_stream.split();
+        let (mut ws_write, mut ws_read) = ws_stream.split();
+
+        // Phase 1: Login
+        let login_msg = SignalMessage::Login {
+            username: username.clone(),
+            password: password.clone(),
+        };
+        ws_write
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&login_msg)?.into(),
+            ))
+            .await
+            .map_err(|_| anyhow::anyhow!("login send error"))?;
+        info!("[{}] Login sent as '{}', waiting for LoginResult", viewer_id, username);
+
+        // Wait for LoginResult
+        loop {
+            let Some(msg) = ws_read.next().await else {
+                anyhow::bail!("WS closed before LoginResult");
+            };
+            let text = match msg {
+                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
+                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                    anyhow::bail!("WS closed before LoginResult");
+                }
+                Err(e) => anyhow::bail!("WS error before LoginResult: {}", e),
+                _ => continue,
+            };
+            let sm: SignalMessage = serde_json::from_str(&text)
+                .context("failed to parse LoginResult")?;
+            match sm {
+                SignalMessage::LoginResult { success, token, reason } => {
+                    if success {
+                        info!("[{}] Login successful, token received", viewer_id);
+                        let _ = token; // token stored for future refresh
+                        break;
+                    } else {
+                        anyhow::bail!("Login failed: {}", reason);
+                    }
+                }
+                SignalMessage::Error { message } => {
+                    anyhow::bail!("Server error during login: {}", message);
+                }
+                _ => {
+                    info!("[{}] Ignoring unexpected message during login: {:?}", viewer_id, sm);
+                }
+            }
+        }
+
+        // Phase 2: Register as Viewer
         let register = SignalMessage::Register {
             id: viewer_id.to_string(),
             role: PeerRole::Viewer,
@@ -332,7 +403,7 @@ impl RtcViewer {
             ))
             .await
             .map_err(|_| anyhow::anyhow!("register send error"))?;
-        info!("[{}] Registered", viewer_id);
+        info!("[{}] Registered as Viewer", viewer_id);
         Ok((ws_write, ws_read))
     }
 
@@ -396,7 +467,6 @@ fn spawn_dc_handler(
                     *input_ch.lock().await = Some(dc);
                 }
                 "clipboard" => {
-                    // Store channel for sending, and also start a reader for host→viewer data
                     let dc_read = dc.clone();
                     *clipboard_ch.lock().await = Some(dc);
                     tokio::spawn(viewer_clipboard_reader(
@@ -500,6 +570,20 @@ fn handle_viewer_clipboard_msg(
             let text = String::from_utf8_lossy(&data[1..]).to_string();
             if let Some(c) = callback {
                 c.on_clipboard_text(text);
+            }
+            state
+        }
+        frame::CLIP_TAG_IMAGE => {
+            // Image clipboard from host: [width:u32le][height:u32le][rgba_data...]
+            if data.len() < 1 + frame::CLIP_IMAGE_HDR_SIZE {
+                warn!("[Viewer] Image clipboard msg too short: {} bytes", data.len());
+                return state;
+            }
+            let width = u32::from_le_bytes(data[1..5].try_into().unwrap_or_default());
+            let height = u32::from_le_bytes(data[5..9].try_into().unwrap_or_default());
+            let rgba = data[9..].to_vec();
+            if let Some(c) = callback {
+                c.on_clipboard_image(rgba, width, height);
             }
             state
         }
@@ -789,6 +873,24 @@ async fn handle_offer(
         SignalMessage::Error { message } => {
             if let Some(c) = callback {
                 c.on_error(message);
+            }
+        }
+        SignalMessage::AuthResult { accepted, reason, .. } => {
+            if accepted {
+                info!("[{}] AuthResult: accepted", viewer_id);
+                if let Some(c) = callback {
+                    c.on_connection_state("auth_accepted".into());
+                }
+            } else {
+                let msg = if reason.is_empty() {
+                    "认证失败".to_string()
+                } else {
+                    format!("认证失败: {}", reason)
+                };
+                warn!("[{}] AuthResult: rejected – {}", viewer_id, msg);
+                if let Some(c) = callback {
+                    c.on_error(msg);
+                }
             }
         }
         _ => {}

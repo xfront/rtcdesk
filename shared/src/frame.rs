@@ -95,6 +95,13 @@ pub const CLIP_TAG_FILE_LIST: u8 = 0x03;
 pub const CLIP_TAG_FILE_CHUNK: u8 = 0x04;
 /// Clipboard transfer complete marker.
 pub const CLIP_TAG_DONE: u8 = 0x05;
+/// Image clipboard data (PNG-encoded).
+/// Wire format: [CLIP_TAG_IMAGE:1][width:u32le][height:u32le][png_data...]
+pub const CLIP_TAG_IMAGE: u8 = 0x06;
+/// Image clipboard header size after tag: width(4) + height(4).
+pub const CLIP_IMAGE_HDR_SIZE: usize = 8;
+/// Max image size to sync via clipboard (8 MB of PNG, larger images skipped).
+pub const CLIP_IMAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Clipboard file list header size after tag: num_files(2) + per_entry(name_len:2 + name:N + size:8).
 pub const CLIP_FILE_LIST_MIN_LEN: usize = 2;
@@ -168,6 +175,8 @@ pub const DEFAULT_QUALITY_IDX: usize = 1;
 pub const DEFAULT_FRAME_W: u32 = 1280;
 pub const DEFAULT_FRAME_H: u32 = 720;
 pub const MIN_SCALE_FACTOR: f64 = 1.0;
+/// Custom titlebar height in CSS pixels. Must match `.titlebar { height: 40px; }` in app.css.
+pub const TITLEBAR_HEIGHT: f64 = 40.0;
 pub const DEFAULT_STUN: &str = "stun:stun.l.google.com:19302";
 pub const DEFAULT_FPS: u32 = 15;
 pub const DEFAULT_CAPTURE_DIM: u32 = 1280;
@@ -176,6 +185,15 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 30;
 pub const DEFAULT_MAX_DIMENSION: u32 = 1920;
 pub const SIGNAL_BROADCAST_CAP: usize = 64;
 pub const STUN_QUERY_TIMEOUT_SECS: u64 = 40;
+
+// ── Chat / stats / file transfer constants ──────────────────────────────
+// 注意：聊天功能使用独立 DataChannel + JSON 序列化，不使用 tagged binary protocol
+/// Stats refresh interval (ms)
+pub const STATS_REFRESH_MS: u64 = 1000;
+/// Screenshot save directory name
+pub const SCREENSHOT_DIR: &str = "rtcdesk";
+/// File size limit for single file transfer (500 MB)
+pub const FILE_TRANSFER_MAX_SIZE: u64 = 500 * 1024 * 1024;
 
 // ── Sender helpers ────────────────────────────────────────────────────────
 

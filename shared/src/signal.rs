@@ -41,11 +41,23 @@ pub enum SignalMessage {
     RequestConnect { from: String, target_id: String },
     /// Error message.
     Error { message: String },
-    /// Connect request with video quality parameter.
+    /// Connect request with video quality parameter and optional password.
     ConnectRequest {
         from: String,
         target_id: String,
         pic_quality: u32,
+        /// Password for host authentication (empty = no password).
+        #[serde(default)]
+        password: String,
+    },
+    /// Host authentication result (accepted / rejected).
+    AuthResult {
+        from: String,
+        to: String,
+        accepted: bool,
+        /// Rejection reason (only meaningful when accepted=false).
+        #[serde(default)]
+        reason: String,
     },
     /// Viewer requests a quality, resolution, or FPS update during an active session.
     QualityUpdate {
@@ -55,12 +67,83 @@ pub enum SignalMessage {
         max_dimension: u32,
         fps: u32,
     },
-    /// Input event (mouse/keyboard).
+    /// 输入事件（鼠标/键盘）
     Input {
         from: String,
         to: String,
         event_type: InputEventType,
         data: Vec<u8>,
+    },
+
+    // ─── 用户认证相关 ────────────────────────────────────────────────────
+
+    /// 用户登录请求
+    Login {
+        username: String,
+        password: String,
+    },
+
+    /// 登录结果
+    LoginResult {
+        success: bool,
+        #[serde(default)]
+        token: String,
+        #[serde(default)]
+        reason: String,
+    },
+
+    /// Token 刷新请求
+    TokenRefresh {
+        token: String,
+    },
+
+    /// Token 刷新结果
+    TokenRefreshResult {
+        success: bool,
+        #[serde(default)]
+        token: String,
+        #[serde(default)]
+        reason: String,
+    },
+
+    // ─── 机器管理相关 ────────────────────────────────────────────────────
+
+    /// Host 注册机器信息
+    MachineRegister {
+        host_id: String,
+        name: String,
+        os: String,
+    },
+
+    /// 在线机器列表
+    MachineList {
+        machines: Vec<MachineInfo>,
+    },
+
+    /// 机器在线状态变更通知
+    MachineStatus {
+        host_id: String,
+        online: bool,
+    },
+
+    /// 心跳消息（Host 定期发送）
+    Heartbeat {
+        host_id: String,
+    },
+
+    // ─── 用户注册 ────────────────────────────────────────────────────
+
+    /// 用户注册请求
+    UserRegister {
+        username: String,
+        password: String,
+    },
+
+    /// 用户注册结果
+    UserRegisterResult {
+        success: bool,
+        #[serde(default)]
+        message: String,
     },
 }
 
@@ -83,6 +166,19 @@ pub enum PeerRole {
     Host,
     /// Remote viewer/controller (KMP client).
     Viewer,
+}
+
+/// 在线机器信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineInfo {
+    /// 机器唯一标识（即 host peer ID）
+    pub host_id: String,
+    /// 机器名称
+    pub name: String,
+    /// 操作系统
+    pub os: String,
+    /// 是否在线
+    pub online: bool,
 }
 
 /// ICE server configuration.

@@ -1,0 +1,27 @@
+[package]
+name = "rtcdesk-signal"
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rtcdesk-signal"
+path = "src/main.rs"
+
+[dependencies]
+rtcdesk-shared = { path = "../shared" }
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+futures-util.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
+jsonwebtoken = "9"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+chrono = { version = "0.4", features = ["serde"] }

@@ -7,7 +7,7 @@ edition.workspace = true
 
 [[bin]]
 name = "rtcdesk"
-path = "main.rs"
+path = "src/main.rs"
 
 [dependencies]
 rtcdesk-shared = { path = "../shared" }
@@ -24,12 +24,15 @@ bytes.workspace = true
 async-trait.workspace = true
 env_logger.workspace = true
 local-ip-address.workspace = true
-arboard.workspace = true
+clipboard-rs.workspace = true
 base64.workspace = true
 keyboard-types.workspace = true
 dioxus-html={ version = "0.7" }
 dioxus = { version = "0.7" }
 image.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+rfd = "0.15"
 
 [features]
 default = ["desktop"]
