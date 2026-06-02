@@ -1,12 +1,14 @@
 //! Home tab: Device list layout with search, groups, and detail panel.
+//! Refactored with dioxus-bootstrap-css components.
 
 use dioxus::prelude::*;
+use dioxus_bootstrap_css::prelude::*;
 
 use crate::config::{load_config, save_config};
 use crate::i18n::{t as tr};
 use crate::i18n::keys;
 use crate::local_id::format_local_id;
-use crate::theme::{tc, Theme};
+use dioxus_bootstrap_css::theme::Theme;
 use crate::Page;
 
 // ─── Device data model ────────────────────────────────────────────────────────
@@ -47,10 +49,8 @@ pub fn HomeTab(
     local_id: Signal<String>,
     password: Signal<String>,
 ) -> Element {
-    let _t = tc(theme());
     let l: &'static str = Box::leak(locale().into_boxed_str());
     let my_id = local_id();
-    let my_id_clone = my_id.clone();
 
     let mut search_text = use_signal(String::new);
     let mut selected_id = use_signal(|| Option::<String>::None);
@@ -75,36 +75,53 @@ pub fn HomeTab(
     });
 
     rsx! {
-        div { class: "device-list-page",
+        div {
+            class: "d-flex flex-grow-1 h-100 overflow-hidden",
 
-            div { class: "device-list-area",
-                div { class: "device-search-row",
-                    div { class: "device-search-input-wrap",
-                        svg_icon_search {}
-                        input {
+            // Left: device list
+            div {
+                class: "flex-grow-1 min-w-0 d-flex flex-column overflow-y-auto",
+                style: "padding: 16px 20px; border-right: 1px solid var(--bs-border-color);",
+
+                // Search row
+                div { class: "d-flex gap-2 mb-3 flex-shrink-0",
+                    InputGroup {
+                        class: "flex-grow-1",
+                        span { class: "input-group-text",
+                            svg {
+                                xmlns: "http://www.w3.org/2000/svg",
+                                width: "14", height: "14",
+                                fill: "none", stroke: "var(--bs-tertiary-color)", stroke_width: "1.5",
+                                path { d: "M7 12a5 5 0 1 0 0-10 5 5 0 0 0 0 10zM13 13l-3-3" }
+                            }
+                        }
+                        Input {
+                            class: "border-0 bg-transparent shadow-none",
                             r#type: "text",
-                            class: "device-search-input",
-                            placeholder: "{tr(keys::HOME_SEARCH_PLACEHOLDER, l)}",
+                            placeholder: tr(keys::HOME_SEARCH_PLACEHOLDER, l),
                             value: "{search_text()}",
-                            oninput: move |e| search_text.set(e.value()),
+                            oninput: move |e: FormEvent| search_text.set(e.value()),
                         }
                         if !search_text().is_empty() {
-                            button {
-                                class: "device-search-clear",
+                            Button {
+                                color: Color::Secondary,
+                                outline: true,
                                 onclick: move |_| search_text.set(String::new()),
                                 "\u{2715}"
                             }
                         }
                     }
-                    button {
-                        class: "device-search-add",
+                    Button {
+                        color: Color::Primary,
+                        outline: true,
                         title: tr(keys::HOME_ADD_DEVICE, l),
                         onclick: move |_| {},
                         "+"
                     }
                 }
 
-                div { class: "device-groups",
+                // Device groups
+                div { class: "d-flex flex-column gap-1 flex-grow-1",
                     for (g_idx, grp) in groups().iter().enumerate() {
                         DeviceGroupWidget {
                             key: "{g_idx}",
@@ -118,16 +135,25 @@ pub fn HomeTab(
                 }
             }
 
+            // Right: detail panel
             if let Some(sid) = selected_id() {
                 DeviceDetailPanel {
                     devices: filtered_devices(),
                     selected_id: sid,
-                    theme,
+                    _theme: theme,
                     locale: l.to_string(),
                 }
             } else {
-                div { class: "device-detail-panel",
-                    div { class: "device-detail-empty", span { "{tr(keys::HOME_SELECT_HINT, l)}" } }
+                div {
+                    class: "d-flex flex-column flex-shrink-0 overflow-y-auto",
+                    style: "width: 280px; min-width: 240px; max-width: 320px;
+                            background: var(--bs-tertiary-bg);
+                            border-left: 1px solid var(--bs-border-color);",
+                    div {
+                        class: "flex-grow-1 d-flex align-items-center justify-content-center small pt-5",
+                        style: "color: var(--bs-tertiary-color);",
+                        "{tr(keys::HOME_SELECT_HINT, l)}"
+                    }
                 }
             }
         }
@@ -151,17 +177,6 @@ fn handle_device_connect(
     })
 }
 
-fn svg_icon_search() -> Element {
-    rsx! {
-        svg {
-            xmlns: "http://www.w3.org/2000/svg",
-            width: "14", height: "14",
-            fill: "none", stroke: "var(--text-dim)", stroke_width: "1.5",
-            path { d: "M7 12a5 5 0 1 0 0-10 5 5 0 0 0 0 10zM13 13l-3-3" }
-        }
-    }
-}
-
 // ─── Device group widget ──────────────────────────────────────────────────
 
 #[component]
@@ -177,26 +192,25 @@ fn DeviceGroupWidget(
     let l: &'static str = Box::leak(locale.into_boxed_str());
 
     rsx! {
-        div { class: "device-group",
-            button {
-                class: "device-group-header",
+        div {
+            Button {
+                color: Color::Light,
+                outline: true,
+                class: "border-0 text-start w-100 d-flex align-items-center gap-2 py-2 px-3",
                 onclick: move |_| expanded.toggle(),
                 span {
-                    style: "transition: transform 0.15s; display:inline-block; font-size:10px; margin-right:4px;",
+                    style: "transition: transform 0.15s; display: inline-block; font-size: 10px;",
                     if expanded() { "\u{25BC}" } else { "\u{25B6}" }
                 }
-                span { style: "font-weight: 600; color: var(--text-pri);", "{group.label}" }
-                span { style: "color: var(--text-dim); font-size: 12px;", "({dev_count})" }
+                span { style: "font-weight: 600;", "{group.label}" }
+                Badge { color: Color::Secondary, class: "ms-1", "{dev_count}" }
             }
             if expanded() && !group.devices.is_empty() {
-                div { class: "device-group-body",
+                div { class: "ps-3 pb-1",
                     for dev in &group.devices {
                         {
                             let did = dev.id.clone();
-                            let sel = match &selected_id {
-                                Some(s) if *s == did => true,
-                                _ => false,
-                            };
+                            let sel = selected_id.as_ref().map_or(false, |s| *s == did);
                             rsx! {
                                 DeviceRow {
                                     device: dev.clone(),
@@ -225,13 +239,11 @@ fn DeviceRow(
     locale: String,
 ) -> Element {
     let l: &'static str = Box::leak(locale.into_boxed_str());
-    let row_class = if selected { "device-row-selected" } else { "device-row" };
     let dot_style = if device.online {
-        "background: var(--accent); box-shadow: 0 0 6px var(--accent);"
+        "background: var(--bs-success); box-shadow: 0 0 6px var(--bs-success);"
     } else {
-        "background: var(--text-dim);"
+        "background: var(--bs-tertiary-color);"
     };
-    let device_id = device.id.clone();
 
     let os_icon = match device.os.as_str() {
         s if s.contains("linux") => "\u{1F427}",
@@ -240,24 +252,30 @@ fn DeviceRow(
         _ => "\u{1F4BB}",
     };
 
-    let sel_id = device_id.clone();
-    let con_id = device_id.clone();
+    let sel_id = device.id.clone();
+    let con_id = device.id.clone();
     let badge_text = tr(keys::HOME_BADGE_LOCAL, l);
+    let row_bg = if selected { "rgba(var(--bs-success-rgb), 0.12)" } else { "transparent" };
 
     rsx! {
         button {
-            class: row_class,
+            class: "btn border-0 text-start w-100 d-flex align-items-center gap-2 py-2 px-3",
+            style: "background: {row_bg}; color: var(--bs-body-color);",
             onclick: move |_| on_select.call(sel_id.clone()),
             ondoubleclick: move |_| on_connect.call(con_id.clone()),
             div {
-                class: "device-dot",
-                style: "{dot_style}",
+                class: "rounded-circle flex-shrink-0",
+                style: "width: 7px; height: 7px; margin-top: 1px; {dot_style}",
             }
-            div { class: "device-name-cell",
-                span { style: "font-size: 14px; margin-right: 6px; flex-shrink: 0;", "{os_icon}" }
-                span { class: "truncate fw-500", "{device.display_name()}" }
+            div { class: "d-flex align-items-center gap-1 flex-grow-1 min-w-0",
+                span { class: "flex-shrink-0", "{os_icon}" }
+                span { class: "text-truncate fw-medium", "{device.display_name()}" }
                 if device.is_local {
-                    span { class: "device-local-badge", "{badge_text}" }
+                    Badge {
+                        color: Color::Secondary,
+                        style: "flex-shrink: 0; white-space: nowrap;",
+                        "{badge_text}"
+                    }
                 }
             }
         }
@@ -270,10 +288,9 @@ fn DeviceRow(
 fn DeviceDetailPanel(
     devices: Vec<DeviceItem>,
     selected_id: String,
-    theme: Signal<Theme>,
+    _theme: Signal<Theme>,
     locale: String,
 ) -> Element {
-    let _t = tc(theme());
     let l: &'static str = Box::leak(locale.into_boxed_str());
 
     let device = devices.iter().find(|d| d.id == selected_id).cloned();
@@ -283,59 +300,66 @@ fn DeviceDetailPanel(
 
     match device {
         Some(dev) => rsx! {
-            div { class: "device-detail-panel",
+            div {
+                class: "d-flex flex-column flex-shrink-0 overflow-y-auto",
+                style: "width: 280px; min-width: 240px; max-width: 320px;
+                        background: var(--bs-tertiary-bg);
+                        border-left: 1px solid var(--bs-border-color);",
 
-                div { class: "device-detail-header",
-                    span { class: "fw-600 text-14", "{tr(keys::HOME_DETAIL_TITLE, l)}" }
-                    button {
-                        style: "color:var(--text-dim);font-size:16px;background:none;border:none;cursor:pointer;padding:4px;",
-                        "\u{2026}"
-                    }
+                div {
+                    class: "d-flex align-items-center justify-content-between px-3 pt-3 pb-2 flex-shrink-0",
+                    span { class: "fw-semibold", "{tr(keys::HOME_DETAIL_TITLE, l)}" }
+                Button {
+                    size: Size::Sm,
+                    class: "border-0 text-secondary",
+                    "\u{2026}"
+                }
                 }
 
-                div { class: "device-detail-section",
-                    div { class: "device-detail-row",
-                        span { class: "device-detail-label", "{tr(keys::HOME_DETAIL_NAME, l)}" }
-                        div { class: "device-detail-value",
-                            span { "{dev.display_name()}" }
-                            button { class: "device-detail-edit-icon", "\u{270E}" }
+                Card { class: "border-0 bg-transparent mx-3 mb-3",
+                    body: rsx! {
+                        div { class: "d-flex justify-content-between py-1",
+                            small { class: "text-secondary", "{tr(keys::HOME_DETAIL_NAME, l)}" }
+                            div { class: "d-flex align-items-center gap-1 fw-medium", "{dev.display_name()}" }
                         }
-                    }
-                    div { class: "device-detail-row",
-                        span { class: "device-detail-label", "{tr(keys::HOME_DETAIL_ALIAS, l)}" }
-                        div { class: "device-detail-value",
-                            span {
-                                style: "color: var(--text-sec);",
-                                "{alias_text}"
+                        div { class: "d-flex justify-content-between py-1",
+                            small { class: "text-secondary", "{tr(keys::HOME_DETAIL_ALIAS, l)}" }
+                            div { class: "d-flex align-items-center gap-1",
+                                small { style: "color: var(--bs-secondary-color);", "{alias_text}" }
+                                Button { size: Size::Sm, class: "border-0 p-0 small text-secondary", "\u{270E}" }
                             }
-                            button { class: "device-detail-edit-icon", "\u{270E}" }
                         }
                     }
                 }
 
                 if dev.is_local {
-                    div { class: "device-detail-section",
-                        span { class: "device-detail-subtitle", "{tr(keys::HOME_DETAIL_UNATTENDED, l)}" }
-
-                        div { class: "device-detail-row",
-                            span { class: "device-detail-label-sm", "{tr(keys::HOME_DETAIL_SYS_AUTH, l)}" }
-                            span { class: "status-set", "{tr(keys::HOME_DETAIL_SET, l)}" }
-                        }
-                        div { class: "device-detail-row",
-                            span { class: "device-detail-label-sm", "{tr(keys::HOME_DETAIL_PW_AUTH, l)}" }
-                            span { class: "status-unset", "{tr(keys::HOME_DETAIL_UNAUTH, l)}" }
-                        }
-                        div { class: "device-detail-row",
-                            span { class: "device-detail-label-sm", "{tr(keys::HOME_DETAIL_AUTOSTART, l)}" }
-                            span { class: "status-active", "{tr(keys::HOME_DETAIL_ACTIVE, l)}" }
+                    Card { class: "border-0 bg-transparent mx-3",
+                        body: rsx! {
+                            h6 { class: "mb-2", "{tr(keys::HOME_DETAIL_UNATTENDED, l)}" }
+                            div { class: "d-flex justify-content-between py-1",
+                                small { class: "text-secondary", "{tr(keys::HOME_DETAIL_SYS_AUTH, l)}" }
+                                small { class: "text-danger", "{tr(keys::HOME_DETAIL_SET, l)}" }
+                            }
+                            div { class: "d-flex justify-content-between py-1",
+                                small { class: "text-secondary", "{tr(keys::HOME_DETAIL_PW_AUTH, l)}" }
+                                small { class: "text-danger", "{tr(keys::HOME_DETAIL_UNAUTH, l)}" }
+                            }
+                            div { class: "d-flex justify-content-between py-1",
+                                small { class: "text-secondary", "{tr(keys::HOME_DETAIL_AUTOSTART, l)}" }
+                                small { class: "text-danger", "{tr(keys::HOME_DETAIL_ACTIVE, l)}" }
+                            }
                         }
                     }
                 }
             }
         },
         None => rsx! {
-            div { class: "device-detail-panel",
-                div { class: "device-detail-empty", span { "{tr(keys::HOME_DETAIL_NOT_FOUND, l)}" } }
+            div {
+                class: "d-flex align-items-center justify-content-center flex-shrink-0 small",
+                style: "width: 280px; min-width: 240px; max-width: 320px;
+                        background: var(--bs-tertiary-bg); border-left: 1px solid var(--bs-border-color);
+                        color: var(--bs-tertiary-color); padding-top: 60px;",
+                "{tr(keys::HOME_DETAIL_NOT_FOUND, l)}"
             }
         },
     }

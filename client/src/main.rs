@@ -2,7 +2,7 @@
 //!
 //! RustDesk-style Dioxus UI. Code is split into the following modules:
 //!
-//! - `theme`        — color tokens, ThemeColors, tc()
+//! - `config`       — AppConfig, load/save, STUN server list
 //! - `config`       — AppConfig, load/save, STUN server list
 //! - `local_id`     — device ID generation and formatting
 //! - `quality`      — QUALITY_PRESETS, ScaleMode
@@ -13,11 +13,11 @@
 mod clipboard;
 mod components;
 mod config;
+mod theme;
 mod host_process;
 mod i18n;
 mod quality;
 mod remote;
-mod theme;
 mod viewer;
 mod toast;
 mod screenshot;
@@ -25,8 +25,8 @@ mod screenshot;
 use dioxus::desktop::{self, tao::window::Fullscreen};
 use dioxus::prelude::*;
 use dioxus::desktop::use_window;
-
-use shared::frame;
+use dioxus_bootstrap_css::prelude::*;
+use dioxus::desktop::trayicon::DioxusTrayIcon;
 use shared::local_id;
 
 use crate::components::auth::AuthCtx;
@@ -39,9 +39,10 @@ use crate::components::resize::ResizeEdges;
 use crate::components::settings::SettingsTab;
 use crate::components::sidebar::{NavTab, Sidebar};
 use crate::components::titlebar::TitleBar;
-use crate::config::{load_config, load_stun_servers};
+use crate::config::{load_config, load_stun_servers, save_config};
 use crate::remote::view::RemoteView;
-use crate::theme::{apply_theme, Theme};
+use crate::config::ThemeConfig;
+use dioxus_bootstrap_css::theme::Theme;
 
 // ─── Page type ───────────────────────────────────────────────────────────────
 
@@ -80,26 +81,31 @@ fn main() {
         .format_timestamp_millis()
         .init();
 
-    let window_icon = load_window_icon();
-
-    let mut win_builder = desktop::WindowBuilder::new()
+    let win_builder = desktop::WindowBuilder::new()
         .with_title("RTCDesk")
+        .with_window_icon(load_window_icon())
         .with_decorations(false)
-        .with_resizable(true)
-        .with_min_inner_size(desktop::LogicalSize::new(900_i32, 600_i32))
-        .with_inner_size(desktop::LogicalSize::new(900_i32, 780_i32));
+        .with_resizable(true);
 
-    if let Some(icon) = window_icon {
-        win_builder = win_builder.with_window_icon(Some(icon));
-    }
+    let cfg = desktop::Config::new()
+        .with_window(win_builder)
+        .with_close_behaviour(WindowCloseBehaviour::WindowHides)
+        .with_tray_icon_show_window_on_click(true);
 
     dioxus::LaunchBuilder::new()
-        .with_cfg(desktop::Config::new().with_window(win_builder))
+        .with_cfg(cfg)
         .launch(app);
 }
 
+fn load_tray_icon() -> Option<DioxusTrayIcon> {
+    let bytes = include_bytes!("assets/favicon.webp");
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    DioxusTrayIcon::from_rgba(rgba.into_raw(), w, h).ok()
+}
 fn load_window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
-    let bytes = include_bytes!("assets/favicon.ico");
+    let bytes = include_bytes!("assets/favicon.webp");
     let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -110,11 +116,11 @@ fn load_window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
 
 #[component]
 fn app() -> Element {
+    // Inject custom app.css (minimal — only window chrome, remote session, theme vars)
     let mut css_injected = use_signal(|| false);
     use_effect(move || {
         if css_injected() { return; }
         css_injected.set(true);
-        // Inject app.css (compiled into binary via include_str!)
         let css = include_str!("assets/app.css");
         let escaped = css.replace('\\', "\\\\").replace('`', "\\`").replace('$', "\\$");
         let _ = document::eval(&format!(
@@ -128,10 +134,21 @@ fn app() -> Element {
     let server_addr = use_signal(move || cfg.server_addr.clone());
     let remote_id   = use_signal(move || cfg.remote_id.clone());
     let quality     = use_signal(move || cfg.quality);
-    let theme       = use_signal(move || cfg.theme);
+    let theme       = use_signal(move || cfg.theme.0);
     let locale      = use_signal(move || cfg.locale.clone());
     let local_id    = use_signal(move || cfg.local_id.clone());
     let password    = use_signal(String::new);
+
+    // Persist theme to config on change
+    use_effect(move || {
+        let t = theme();
+        let mut c = load_config();
+        let tc = ThemeConfig(t);
+        if c.theme.0 != t {
+            c.theme = tc;
+            save_config(&c);
+        }
+    });
 
     // Provide shared Host context (persists across tab switches)
     use_context_provider(|| HostCtx::new());
@@ -147,6 +164,7 @@ fn app() -> Element {
     let mut is_fullscreen = use_signal(|| false);
     let win = use_window();
     let win2 = win.clone();
+    let win_tray = win.clone(); // captured for tray menu "Show" handler
 
     use_effect(move || {
         // Explicit read to ensure the effect subscribes to window_cmd changes.
@@ -188,24 +206,55 @@ fn app() -> Element {
         }
     });
 
+    // ── System tray icon ──────────────────────────────────────────────────
+    let mut tray_initialized = use_signal(|| false);
+    use_effect(move || {
+        if tray_initialized() { return; }
+        tray_initialized.set(true);
+        let icon = load_tray_icon();
+
+        // Build a custom menu with MenuItem instead of PredefinedMenuItem
+        // because PredefinedMenuItem::quit is unsupported on Linux.
+        use dioxus::desktop::trayicon::menu::{Menu, MenuItem};
+        let menu = Menu::new();
+        menu.append_items(&[
+            &MenuItem::with_id("show", "&Show RTCDesk", true, None),
+            &MenuItem::with_id("quit", "&Quit", true, None),
+        ]).ok();
+
+        dioxus::desktop::trayicon::init_tray_icon(menu, icon);
+    });
+
+    // Handle tray menu events (Show / Quit)
+    // NOTE: tray_icon::menu::MenuEvent is a re-export of muda::MenuEvent,
+    // and dioxus-desktop dispatches these as UserWindowEvent::MudaMenuEvent.
+    dioxus::desktop::use_muda_event_handler(move |event| {
+        match event.id.as_ref() {
+            "show" => {
+                let w: &dioxus::desktop::tao::window::Window = &*win_tray;
+                w.set_visible(true);
+                w.set_focus();
+            }
+            "quit" => {
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    });
+
     // Resize window when switching between Main and Remote views
     use_effect(move || {
         let tao_win: &dioxus::desktop::tao::window::Window = &*win2;
         // Avoid resizing when in fullscreen
         if is_fullscreen() { return; }
         let (w_res, h_res) = match page() {
-            Page::Main   => (900_u32, 780_u32),
+            Page::Main   => (800_u32, 600_u32),
             Page::Remote => (1280_u32, 800_u32),
         };
         let cur = tao_win.inner_size();
         if cur.width != w_res || cur.height != h_res {
             let _ = tao_win.set_inner_size(desktop::LogicalSize::new(w_res, h_res));
         }
-    });
-
-    // React to theme changes → update CSS variables via data-theme attribute
-    use_effect(move || {
-        apply_theme(theme());
     });
 
     // ── Auto-start host service on launch ──────────────────────────────────
@@ -245,9 +294,18 @@ fn app() -> Element {
         });
     }
 
-    match page() {
-        Page::Main   => rsx! { MainWindow { page, server_addr, remote_id, quality, theme, locale, local_id, password } },
-        Page::Remote => rsx! { RemoteView { page, server_addr, remote_id, quality, theme, locale, password, window_cmd, is_fullscreen } },
+    rsx! {
+        // Bootstrap head — loads Bootstrap 5.3 CSS + Bootstrap Icons
+        BootstrapHead {}
+
+        // Bootstrap theme provider — toggles data-bs-theme for Bootstrap components
+        ThemeProvider { theme }
+
+        // Main content
+        match page() {
+            Page::Main   => rsx! { MainWindow { page, server_addr, remote_id, quality, theme, locale, local_id, password } },
+            Page::Remote => rsx! { RemoteView { page, server_addr, remote_id, quality, theme, locale, password, window_cmd, is_fullscreen } },
+        }
     }
 }
 
@@ -268,15 +326,19 @@ fn MainWindow(
 
     rsx! {
         div {
-            class: "main-window",
+            style: "display: flex; flex-direction: column; width: 100vw; height: 100vh;
+                    background: var(--bs-body-bg); border: 1px solid var(--bs-border-color);
+                    border-radius: 10px; overflow: hidden; user-select: none;
+                    color: var(--bs-body-color);",
 
             TitleBar { title: "RTCDesk", theme, locale }
 
             div {
-                class: "main-body",
-                Sidebar { nav_tab, theme, locale }
+                class: "d-flex flex-fill overflow-hidden",
+                Sidebar { nav_tab, _theme: theme, locale }
                 div {
-                    class: "main-content",
+                    class: "flex-fill d-flex flex-column overflow-y-auto",
+                    style: "background: var(--bs-body-bg);",
                     match nav_tab() {
                         NavTab::Home     => rsx! { HomeTab    { page, server_addr, remote_id, quality, theme, locale, local_id, password } },
                         NavTab::Connect  => rsx! { ConnectTab { page, server_addr, remote_id, quality, theme, locale, password, local_id } },

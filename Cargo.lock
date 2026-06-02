@@ -1767,6 +1767,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dioxus-bootstrap-css"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6db78ebb6dc314caac57a152f1718f57374553e7ce39da008095fd0f8b5b890"
+dependencies = [
+ "dioxus",
+ "gloo-timers",
+]
+
+[[package]]
 name = "dioxus-cli-config"
 version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6672,7 +6682,7 @@ dependencies = [
  "chrono",
  "clipboard-rs",
  "dioxus",
- "dioxus-html",
+ "dioxus-bootstrap-css",
  "dirs",
  "env_logger",
  "futures-util",

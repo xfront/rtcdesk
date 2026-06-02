@@ -1,13 +1,15 @@
 //! Login/Register component.
+//! Refactored with dioxus-bootstrap-css components.
 //!
 //! Provides login and registration forms, communicating with signaling server via WebSocket.
 
 use dioxus::prelude::*;
+use dioxus_bootstrap_css::prelude::*;
 
 use crate::config::{load_config, save_config};
 use crate::i18n::{t as tr, tf};
 use crate::i18n::keys;
-use crate::theme::{tc, Theme};
+use dioxus_bootstrap_css::theme::Theme;
 
 // ─── Auth status ─────────────────────────────────────────────────────────────
 
@@ -45,17 +47,17 @@ pub fn AuthSection(
     theme: Signal<Theme>,
     locale: Signal<String>,
 ) -> Element {
-    let AuthCtx { mut status, mut username, mut password } = use_context::<AuthCtx>();
-    let t = tc(theme());
+    let AuthCtx { status, mut username, mut password } = use_context::<AuthCtx>();
+    let _t = theme();
     let l: &'static str = Box::leak(locale().into_boxed_str());
 
     let current_status = status();
-    let status_display = match &current_status {
-        AuthStatus::LoggedOut => (tr(keys::AUTH_NOT_LOGGED_IN, l), t.text_dim, "○"),
-        AuthStatus::LoggingIn => (tr(keys::AUTH_LOGGING_IN, l), t.warn, "⏳"),
-        AuthStatus::Registering => (tr(keys::AUTH_REGISTERING, l), t.warn, "⏳"),
-        AuthStatus::LoggedIn { username } => (username.as_str(), t.accent, "●"),
-        AuthStatus::Error(msg) => (msg.as_str(), t.danger, "⚠"),
+    let (status_text, status_badge_color) = match &current_status {
+        AuthStatus::LoggedOut => (tr(keys::AUTH_NOT_LOGGED_IN, l), Color::Secondary),
+        AuthStatus::LoggingIn => (tr(keys::AUTH_LOGGING_IN, l), Color::Warning),
+        AuthStatus::Registering => (tr(keys::AUTH_REGISTERING, l), Color::Warning),
+        AuthStatus::LoggedIn { username } => (username.as_str(), Color::Success),
+        AuthStatus::Error(msg) => (msg.as_str(), Color::Danger),
     };
 
     let is_busy = matches!(&current_status, AuthStatus::LoggingIn | AuthStatus::Registering);
@@ -68,25 +70,21 @@ pub fn AuthSection(
     let logout_label = tr(keys::AUTH_BTN_LOGOUT, l);
 
     rsx! {
-        super::settings::SettingsSection { title: tr(keys::AUTH_ACCOUNT, l), theme,
+        super::settings::SettingsSection { title: tr(keys::AUTH_ACCOUNT, l),
             children: rsx! {
                 // Status display
                 div {
-                    class: "flex-between",
-                    style: "margin-bottom: 14px; padding: 8px 12px; border-radius: 8px; background: var(--bg-ter);",
-                    div {
-                        class: "flex-center-row",
-                        style: "gap: 8px;",
-                        span { style: "font-size: 14px;", "{status_display.2}" }
-                        span {
-                            style: "font-size: 14px; font-weight: 600; color: {status_display.1};",
-                            "{status_display.0}"
-                        }
+                    class: "d-flex align-items-center justify-content-between mb-3
+                            p-2 rounded-2",
+                    style: "background: var(--bs-tertiary-bg);",
+                    div { class: "d-flex align-items-center gap-2",
+                        Badge { color: status_badge_color, class: "me-1", "{status_text}" }
                     }
                     if is_logged_in {
-                        button {
-                            class: "btn-outline-danger",
-                            style: "font-size: 12px; padding: 4px 12px;",
+                        Button {
+                            color: Color::Danger,
+                            outline: true,
+                            size: Size::Sm,
                             onclick: {
                                 let mut s = status;
                                 move |_| {
@@ -102,60 +100,65 @@ pub fn AuthSection(
                     }
                 }
 
-                super::connect::FormField { label: tr(keys::AUTH_LABEL_USER, l), theme,
-                    input {
+                super::connect::FormField { label: tr(keys::AUTH_LABEL_USER, l),
+                    Input {
                         r#type: "text",
-                        class: "input",
                         placeholder: tr(keys::AUTH_PLACEHOLDER_USER, l),
                         value: "{username}",
                         disabled: is_busy,
-                        oninput: move |e| username.set(e.value()),
+                        oninput: move |e: FormEvent| username.set(e.value()),
                     }
                 }
 
-                super::connect::FormField { label: tr(keys::AUTH_LABEL_PW, l), theme,
-                    input {
+                super::connect::FormField { label: tr(keys::AUTH_LABEL_PW, l),
+                    Input {
                         r#type: "password",
-                        class: "input",
                         placeholder: tr(keys::AUTH_PLACEHOLDER_PW, l),
                         value: "{password}",
                         disabled: is_busy,
-                        oninput: move |e| password.set(e.value()),
+                        oninput: move |e: FormEvent| password.set(e.value()),
                     }
                 }
 
-                div {
-                    class: "flex-center-row",
-                    style: "gap: 8px; margin-top: 4px;",
-
-                    button {
-                        class: "btn-primary-sm",
-                        style: "flex: 1;",
+                div { class: "d-flex gap-2 mt-2",
+                    Button {
+                        color: Color::Primary,
+                        class: "flex-grow-1",
                         disabled: is_busy || username().is_empty() || password().is_empty(),
                         onclick: move |_| do_login(username(), password(), status, l.to_string()),
-                        if matches!(status(), AuthStatus::LoggingIn) { "{login_busy_label}" } else { "{login_label}" }
+                        if matches!(status(), AuthStatus::LoggingIn) {
+                            Spinner { style: SpinnerStyle::Border, size: Size::Sm, class: "me-1" }
+                            "{login_busy_label}"
+                        } else {
+                            "{login_label}"
+                        }
                     }
 
-                    button {
-                        class: "btn-outline-accent",
-                        style: "flex: 1;",
+                    Button {
+                        color: Color::Success,
+                        outline: true,
+                        class: "flex-grow-1",
                         disabled: is_busy || username().is_empty() || password().is_empty(),
                         onclick: move |_| do_register(username(), password(), status, l.to_string()),
-                        if matches!(status(), AuthStatus::Registering) { "{register_busy_label}" } else { "{register_label}" }
+                        if matches!(status(), AuthStatus::Registering) {
+                            Spinner { style: SpinnerStyle::Border, size: Size::Sm, class: "me-1" }
+                            "{register_busy_label}"
+                        } else {
+                            "{register_label}"
+                        }
                     }
                 }
 
                 if let AuthStatus::Error(msg) = &current_status {
-                    div {
-                        class: "text-danger",
-                        style: "font-size: 12px; margin-top: 8px; line-height: 1.5;",
+                    Alert {
+                        color: Color::Danger,
+                        class: "mt-2 mb-0 py-2",
                         "{msg}"
                     }
                 }
 
-                div {
-                    class: "text-dim text-11",
-                    style: "margin-top: 10px; line-height: 1.5;",
+                p {
+                    class: "text-secondary small mt-2 mb-0 lh-sm",
                     "{tr(keys::AUTH_HELP, l)}"
                 }
             }

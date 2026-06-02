@@ -18,6 +18,7 @@ pub enum ScaleMode {
 }
 
 impl ScaleMode {
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             ScaleMode::Fit      => "自适应",

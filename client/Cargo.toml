@@ -27,8 +27,8 @@ local-ip-address.workspace = true
 clipboard-rs.workspace = true
 base64.workspace = true
 keyboard-types.workspace = true
-dioxus-html={ version = "0.7" }
 dioxus = { version = "0.7" }
+dioxus-bootstrap-css = "0.3"
 image.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"

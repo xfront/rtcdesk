@@ -36,6 +36,7 @@ pub trait ViewerCallback: Send + Sync {
     /// `rgba` is raw RGBA pixel data, `width`×`height` in pixels.
     fn on_clipboard_image(&self, _rgba: Vec<u8>, _width: u32, _height: u32) {}
     /// 周期性调用，提供更新的连接统计信息。
+    #[allow(dead_code)]
     fn on_stats_update(&self, _stats: crate::remote::viewer_loop::ConnectionStats) {}
 }
 
@@ -68,6 +69,7 @@ pub struct RtcViewer {
     fps: u32,             // 视频帧率
     width: u32,           // 视频宽度
     height: u32,          // 视频高度
+    #[allow(dead_code)]
     bitrate: Option<u32>, // 视频比特率
 }
 
@@ -111,6 +113,7 @@ impl RtcViewer {
     }
 
     /// 设置视频比特率（kbps）
+    #[allow(dead_code)]
     pub fn set_bitrate(&mut self, bitrate: Option<u32>) {
         self.bitrate = bitrate;
     }
@@ -255,6 +258,7 @@ impl RtcViewer {
     ///
     /// Each chunk is sent as an individual DataChannel message to avoid SCTP
     /// message size limits and allow the host to process them one at a time.
+    #[allow(dead_code)]
     pub async fn send_files(&self, file_list: Vec<u8>, chunks: Vec<u8>) -> Result<()> {
         let ch = self.clipboard_channel.lock().await;
         if let Some(ref dc) = *ch {

@@ -106,6 +106,7 @@ pub struct GuiCallback {
     pub frame_tx:     mpsc::UnboundedSender<(Vec<u8>, u32, u32, u32, u32)>,
     pub state_tx:     mpsc::UnboundedSender<SessionState>,
     pub clipboard_tx: mpsc::UnboundedSender<String>,
+    #[allow(dead_code)]
     pub stats_tx:     mpsc::UnboundedSender<ConnectionStats>,
 }
 
@@ -172,10 +173,12 @@ pub struct ViewerState {
     pub clipboard_synced: Signal<bool>,
     pub page:             Signal<Page>,
     pub view_only:        Signal<bool>,
+    #[allow(dead_code)]
     pub is_fullscreen:    Signal<bool>,
     pub window_cmd:       Signal<Vec<crate::WindowCmd>>,
     pub stats:            Signal<ConnectionStats>,
     pub file_transfer:    Signal<crate::remote::file_transfer::FileTransferState>,
+    #[allow(dead_code)]
     pub toast:            Signal<Option<crate::toast::ToastMessage>>,
 }
 

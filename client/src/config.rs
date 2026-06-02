@@ -2,7 +2,33 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::theme::Theme;
+pub use dioxus_bootstrap_css::theme::Theme;
+
+// ─── Serde-compatible theme wrapper ────────────────────────────────────────
+
+/// Wraps `Theme` with Serialize/Deserialize for config persistence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemeConfig(pub Theme);
+
+impl Default for ThemeConfig {
+    fn default() -> Self { ThemeConfig(Theme::Light) }
+}
+
+impl Serialize for ThemeConfig {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ThemeConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(ThemeConfig(match s.as_str() {
+            "dark" | "Dark" => Theme::Dark,
+            _ => Theme::Light,
+        }))
+    }
+}
 
 // ─── History entry ──────────────────────────────────────────────────────────
 
@@ -32,9 +58,9 @@ pub struct AppConfig {
     /// STUN server list.  Empty → use default.
     #[serde(default)]
     pub stun_servers: Vec<String>,
-    /// UI theme preference.
+    /// UI theme preference ("dark" or "light").
     #[serde(default)]
-    pub theme: Theme,
+    pub theme: ThemeConfig,
     /// UI language / locale id (BCP 47 tag, from `i18n.locale` in *.ini).
     #[serde(default = "default_locale")]
     pub locale: String,

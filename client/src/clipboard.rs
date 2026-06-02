@@ -6,9 +6,7 @@
 //! `clipboard-rs` handles the platform specifics, so this module is free
 //! of external process spawning (no xclip / wl-paste / wl-copy).
 
-use clipboard_rs::{Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher,
-                   ClipboardWatcherContext, WatcherShutdown, common::RustImage, RustImageData};
-use log::{error, warn};
+use clipboard_rs::{Clipboard, ClipboardContext, common::RustImage, RustImageData};
 
 // ── Clipboard context factory ────────────────────────────────────────────────
 
@@ -108,7 +106,7 @@ pub fn get_clipboard_image() -> Option<ClipboardImage> {
 }
 
 /// Write raw RGBA image data to the system clipboard.
-pub fn set_clipboard_image(rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
+pub fn set_clipboard_image(rgba: &[u8], _width: u32, _height: u32) -> Result<(), String> {
     let img = RustImageData::from_bytes(rgba)
     .map_err(|e| format!("from_rgba: {e}"))?;
     ctx()?

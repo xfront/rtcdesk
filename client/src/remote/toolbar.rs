@@ -1,6 +1,7 @@
 //! Remote session toolbar: floating, auto-hiding, quality/scale menus.
 
 use dioxus::prelude::*;
+use dioxus_bootstrap_css::prelude::*;
 use crate::i18n::{t as tr};
 use crate::i18n::keys;
 use crate::quality::{ScaleMode, QUALITY_PRESETS, SCALE_MODES};
@@ -38,119 +39,122 @@ pub fn RemoteToolbar(
     let ty = if toolbar_visible() || toolbar_pinned() {
         "0px"
     } else {
-        "-40px"
+        "-44px"
     };
     rsx! {
         div {
-            class: "remote-toolbar",
-            style: "transform: translateX(-50%) translateY({ty});",
+            class: "position-absolute d-flex align-items-center",
+            style: "top: 0; left: 50%; transform: translateX(-50%) translateY({ty});
+                    background: var(--toolbar); border-radius: 0 0 12px 12px;
+                    padding: 5px 10px; gap: 2px; z-index: 50;
+                    transition: transform 0.8s ease;
+                    box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+                    backdrop-filter: blur(12px);
+                    border: 1px solid var(--toolbar-border); border-top: none;",
             onmouseenter: move |_| { if !toolbar_pinned() { toolbar_visible.set(true); } },
             onmouseleave: move |_| { if !toolbar_pinned() { toolbar_visible.set(false); } },
 
-            {tb_icon_btn(
-                if toolbar_pinned() { "📍" } else { "📌" },
-                if toolbar_pinned() { tr(keys::TB_UNPIN, l) } else { tr(keys::TB_PIN, l) },
-                if toolbar_pinned() { "var(--accent)" } else { "var(--text-sec)" },
-                on_toggle_pin,
-            )}
-            div { class: "remote-toolbar-divider" }
+            ButtonToolbar {
+                ButtonGroup {
+                    {tb_icon_btn(
+                        if toolbar_pinned() { "📍" } else { "📌" },
+                        if toolbar_pinned() { tr(keys::TB_UNPIN, l) } else { tr(keys::TB_PIN, l) },
+                        if toolbar_pinned() { "var(--bs-success)" } else { "var(--bs-secondary-color)" },
+                        on_toggle_pin,
+                    )}
+                }
 
-            // Quality menu
-            div { style: "position: relative;",
-                {tb_btn_text(tr(keys::TB_QUALITY, l), &q_name, false, on_show_quality_menu)}
-                if show_quality_menu() {
-                    div {
-                        class: "tb-dropdown",
-                        onmouseleave: move |_| show_quality_menu.set(false),
-                        for (idx, preset) in QUALITY_PRESETS.iter().enumerate() {
-                            {
-                                let a = idx == quality_idx();
-                                let (clr, bg) = if a {
-                                    ("var(--accent)", "var(--accent-bg)")
-                                } else {
-                                    ("var(--text-pri)", "transparent")
-                                };
-                                let ql = crate::i18n::quality_label(idx, l);
-                                rsx! {
-                                    div { key: "q_{idx}",
-                                        class: "tb-dropdown-item",
-                                        style: "color: {clr}; background: {bg};",
-                                        onmousedown: move |_| on_select_quality.call(idx),
-                                        span { "{ql}" }
-                                        span { class: "text-dim", style: "font-size: 11px;", "{preset.2}x{preset.3}" }
+                ButtonGroup {
+                    Dropdown {
+                        toggle_class: "tb-button",
+                        open: show_quality_menu,
+                        toggle: rsx! {"🎚"},
+                        menu: rsx! {
+                            div {
+                                class: "tb-dropdown-menu",
+                                for (idx, preset) in QUALITY_PRESETS.iter().enumerate() {
+                                    {
+                                        let a = idx == quality_idx();
+                                        let ql = crate::i18n::quality_label(idx, l);
+                                        rsx! {
+                                            DropdownItem {
+                                                key: "q_{idx}",
+                                                active: a,
+                                                onclick: move |_| on_select_quality.call(idx),
+                                                div { class: "small",
+                                                    span { "{ql}" }
+                                                    span { class: "small", style: "color: var(--bs-tertiary-color);", "{preset.2}x{preset.3}" }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        }
+                        },
                     }
-                }
-            }
 
-            div { class: "remote-toolbar-divider" }
-
-            // Scale menu
-            div { style: "position: relative;",
-                {tb_btn_text(tr(keys::TB_SCALE, l), crate::i18n::scale_label(scale_mode(), l), false, on_show_scale_menu)}
-                if show_scale_menu() {
-                    div {
-                        class: "tb-dropdown-sm",
-                        onmouseleave: move |_| show_scale_menu.set(false),
-                        for sm in SCALE_MODES {
-                            {
-                                let a = *sm == scale_mode();
-                                let (clr, bg) = if a {
-                                    ("var(--accent)", "var(--accent-bg)")
-                                } else {
-                                    ("var(--text-pri)", "transparent")
-                                };
-                                let s = *sm;
-                                let sl = crate::i18n::scale_label(s, l);
-                                rsx! {
-                                    div { key: "sm_{s:?}",
-                                        class: "tb-dropdown-item",
-                                        style: "color: {clr}; background: {bg};",
-                                        onmousedown: move |_| on_select_scale.call(s),
-                                        "{sl}"
+                    // Scale menu
+                    Dropdown {
+                        toggle_class: "tb-button",
+                        open: show_scale_menu,
+                        toggle: rsx! {"⊠"},
+                        menu: rsx! {
+                            div {
+                                class: "tb-dropdown-menu",
+                                for sm in SCALE_MODES {
+                                    {
+                                        let a = *sm == scale_mode();
+                                        let s = *sm;
+                                        let sl = crate::i18n::scale_label(s, l);
+                                        rsx! {
+                                            DropdownItem {
+                                                key: "sm_{s:?}",
+                                                active: a,
+                                                onclick: move |_| on_select_scale.call(s),
+                                                span { class: "small", "{sl}" }
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        }
+                        },
                     }
                 }
+
+                ButtonGroup {
+                    {tb_icon_btn(
+                        if view_only() { "👁" } else { "👁‍🗨" },
+                        if view_only() { tr(keys::TB_EXIT_VIEW_ONLY, l) } else { tr(keys::TB_VIEW_ONLY, l) },
+                        if view_only() { "var(--bs-warning)" } else { "var(--bs-body-color)" },
+                        on_toggle_view_only,
+                    )}
+                    {tb_icon_btn("📷", tr(keys::TB_SCREENSHOT, l), "var(--bs-body-color)", on_screenshot)}
+                    {tb_icon_btn("📎", tr(keys::TB_SEND_FILE, l), "var(--bs-body-color)", on_open_file_dialog)}
+                }
+
+                ButtonGroup {
+                    {tb_icon_btn(
+                        if clipboard_synced() { "✔" } else { "📋" },
+                        if clipboard_synced() { tr(keys::TB_CLIPBOARD_SYNCED, l) } else { tr(keys::TB_SYNC_CLIPBOARD, l) },
+                        if clipboard_synced() { "var(--bs-success)" } else { "var(--bs-body-color)" },
+                        on_toggle_clipboard,
+                    )}
+                }
+
+                ButtonGroup {
+                    {tb_icon_btn("━", tr(keys::TB_MINIMIZE, l), "var(--bs-body-color)", on_minimize)}
+                    {tb_icon_btn(
+                        if is_fullscreen() { "⊡" } else { "⛶" },
+                        if is_fullscreen() { tr(keys::TB_EXIT_FULLSCREEN, l) } else { tr(keys::TB_FULLSCREEN, l) },
+                        "var(--bs-body-color)",
+                        on_toggle_fullscreen,
+                    )}
+                }
+
+                ButtonGroup {
+                    {tb_icon_btn_danger("✕", tr(keys::TB_DISCONNECT, l), on_disconnect)}
+                }
             }
-
-            div { class: "remote-toolbar-divider" }
-
-            {tb_icon_btn(
-                if view_only() { "👁" } else { "👁‍🗨" },
-                if view_only() { tr(keys::TB_EXIT_VIEW_ONLY, l) } else { tr(keys::TB_VIEW_ONLY, l) },
-                if view_only() { "var(--warn)" } else { "var(--text-pri)" },
-                on_toggle_view_only,
-            )}
-            {tb_icon_btn("📷", tr(keys::TB_SCREENSHOT, l), "var(--text-pri)", on_screenshot)}
-            {tb_icon_btn("📎", tr(keys::TB_SEND_FILE, l), "var(--text-pri)", on_open_file_dialog)}
-
-            div { class: "remote-toolbar-divider" }
-
-            {tb_icon_btn(
-                if clipboard_synced() { "✔" } else { "📋" },
-                if clipboard_synced() { tr(keys::TB_CLIPBOARD_SYNCED, l) } else { tr(keys::TB_SYNC_CLIPBOARD, l) },
-                if clipboard_synced() { "var(--accent)" } else { "var(--text-pri)" },
-                on_toggle_clipboard,
-            )}
-
-            div { class: "remote-toolbar-divider" }
-
-            {tb_icon_btn("━", tr(keys::TB_MINIMIZE, l), "var(--text-pri)", on_minimize)}
-
-            {tb_icon_btn(
-                if is_fullscreen() { "⊡" } else { "⛶" },
-                if is_fullscreen() { tr(keys::TB_EXIT_FULLSCREEN, l) } else { tr(keys::TB_FULLSCREEN, l) },
-                "var(--text-pri)",
-                on_toggle_fullscreen,
-            )}
-
-            {tb_icon_btn_danger("✕", tr(keys::TB_DISCONNECT, l), on_disconnect)}
         }
     }
 }
@@ -165,9 +169,11 @@ fn tb_icon_btn(
 ) -> Element {
     let color_owned = color.to_string();
     rsx! {
-        div {
-            class: "tb-icon-btn",
-            style: "color: {color_owned};",
+        Button {
+            outline: true,
+            size: Size::Sm,
+            class: "border-0 p-0 d-inline-flex align-items-center justify-content-center",
+            style: "color: {color_owned}; width: 32px; height: 32px; border-radius: 7px;",
             title: hint,
             onclick: move |_| onclick.call(()),
             "{icon}"
@@ -177,30 +183,14 @@ fn tb_icon_btn(
 
 fn tb_icon_btn_danger(icon: &str, hint: &str, onclick: EventHandler<()>) -> Element {
     rsx! {
-        div {
-            class: "tb-icon-btn",
-            style: "color: var(--danger);",
+        Button {
+            outline: true,
+            size: Size::Sm,
+            class: "border-0 p-0 d-inline-flex align-items-center justify-content-center",
+            style: "color: var(--bs-danger); width: 32px; height: 32px; border-radius: 7px;",
             title: hint,
             onclick: move |_| onclick.call(()),
             "{icon}"
-        }
-    }
-}
-
-fn tb_btn_text(
-    label: &str,
-    value: &str,
-    active: bool,
-    onclick: EventHandler<()>,
-) -> Element {
-    let clr = if active { "var(--accent)" } else { "var(--text-pri)" };
-    rsx! {
-        div {
-            class: "tb-text-btn",
-            style: "color: {clr};",
-            onclick: move |_| onclick.call(()),
-            span { style: "color: var(--text-sec);", "{label}:" }
-            span { style: "font-weight: 500;", "{value}" }
         }
     }
 }

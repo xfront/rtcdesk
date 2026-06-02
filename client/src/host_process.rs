@@ -135,7 +135,7 @@ pub type SharedHostProcess = Arc<Mutex<Option<HostProcess>>>;
 /// - **Other** — always returns `false`.
 pub fn is_host_running() -> bool {
     // Resolve the binary path so we know which names to look for.
-    let mut names: Vec<String> = match find_service_binary_path() {
+    let names: Vec<String> = match find_service_binary_path() {
         Some(p) => {
             let stem = p
                 .file_stem()

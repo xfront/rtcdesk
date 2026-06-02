@@ -1,7 +1,7 @@
 //! Mouse event coordinate mapping and button helpers.
 
+use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
-use dioxus_html::input_data::MouseButton;
 use tokio::sync::mpsc;
 
 use shared::frame;

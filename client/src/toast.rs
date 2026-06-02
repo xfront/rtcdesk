@@ -1,4 +1,4 @@
-//! Toast 通知组件。
+//! Toast notification component (custom implementation using Bootstrap-styled CSS).
 
 use dioxus::prelude::*;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 pub enum ToastType {
     Success,
     Error,
+    #[allow(dead_code)]
     Info,
 }
 
@@ -26,6 +27,7 @@ impl ToastMessage {
     pub fn error(text: impl Into<String>) -> Self {
         Self { text: text.into(), toast_type: ToastType::Error, created_at: Instant::now() }
     }
+    #[allow(dead_code)]
     pub fn info(text: impl Into<String>) -> Self {
         Self { text: text.into(), toast_type: ToastType::Info, created_at: Instant::now() }
     }
@@ -39,7 +41,7 @@ impl ToastMessage {
 
 #[component]
 pub fn ToastOverlay(toast: Signal<Option<ToastMessage>>) -> Element {
-    // 3 秒后自动隐藏
+    // Auto-hide after 3 seconds
     use_future(move || {
         let mut t = toast;
         async move {
@@ -59,9 +61,9 @@ pub fn ToastOverlay(toast: Signal<Option<ToastMessage>>) -> Element {
         None => rsx! {},
         Some(ref m) => {
             let (icon, toast_class) = match m.toast_type {
-                ToastType::Success => ("✓", "toast toast-success"),
-                ToastType::Error   => ("✗", "toast toast-error"),
-                ToastType::Info    => ("ℹ", "toast toast-info"),
+                ToastType::Success => ("✓", "toast-custom toast-custom-success"),
+                ToastType::Error   => ("✗", "toast-custom toast-custom-error"),
+                ToastType::Info    => ("ℹ", "toast-custom toast-custom-info"),
             };
             let text = m.text.clone();
             rsx! {

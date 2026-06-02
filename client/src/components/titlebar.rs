@@ -1,22 +1,22 @@
-//! Custom title bar: TitleBar, WinBtn, ThemeToggleBtn.
+//! Custom title bar: TitleBar, WinBtn.
+//! Uses dioxus-bootstrap-css for theme toggle.
 
+use std::sync::LazyLock;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use dioxus::desktop::use_window;
 use dioxus::prelude::*;
+use dioxus_bootstrap_css::prelude::*;
+use dioxus_bootstrap_css::theme::Theme;
 
-use crate::config::{load_config, save_config};
 use crate::i18n::{t as tr};
 use crate::i18n::keys;
-use crate::theme::{tc, Theme, DARK};
 
-/// Theme info for dropdown items.
-const THEME_ITEMS: &[(Theme, &str, &str)] = &[
-    (Theme::Dark,       "🌙", "settings.theme_dark"),
-    (Theme::SkyBlue,    "🔵", "settings.theme_sky_blue"),
-    (Theme::Light,      "☀",  "settings.theme_light"),
-    (Theme::GrassGreen, "🌿", "settings.theme_grass_green"),
-    (Theme::Orange,     "🍊", "settings.theme_orange"),
-    (Theme::Purple,     "🟣", "settings.theme_purple"),
-];
+const LOGO_BYTES: &[u8] = include_bytes!("../assets/favicon.webp");
+pub static LOGO_DATA_URL: LazyLock<String> = LazyLock::new(|| {
+    format!("data:image/webp;base64,{}", STANDARD.encode(LOGO_BYTES))
+});
 
 // ─── Title bar ──────────────────────────────────────────────────────────────
 
@@ -24,12 +24,14 @@ const THEME_ITEMS: &[(Theme, &str, &str)] = &[
 pub fn TitleBar(title: String, theme: Signal<Theme>, locale: Signal<String>) -> Element {
     let window = use_window();
     let (w1, w2, w3) = (window.clone(), window.clone(), window.clone());
-    let t = tc(theme());
     let l: &'static str = Box::leak(locale().into_boxed_str());
 
     rsx! {
         div {
-            class: "titlebar",
+            class: "d-flex align-items-center flex-shrink-0 px-3",
+            style: "height: 40px; background: var(--bs-tertiary-bg);
+                    border-bottom: 1px solid var(--bs-border-color);
+                    -webkit-app-region: drag;",
             onmousedown: move |_| {
                 let win: &dioxus::desktop::tao::window::Window = &**window;
                 let _ = win.drag_window();
@@ -37,34 +39,33 @@ pub fn TitleBar(title: String, theme: Signal<Theme>, locale: Signal<String>) -> 
 
             // Logo + title
             div {
-                class: "titlebar-left",
-                div {
-                    class: "titlebar-logo",
-                    "R"
+                class: "d-flex align-items-center gap-2 flex-grow-1 pe-none",
+                img {
+                    src: "{LOGO_DATA_URL.as_str()}",
+                    style: "width: 22px; height: 22px; flex-shrink: 0;",
                 }
-                span { class: "text-pri", style: "font-size: 13px; font-weight: 600;", "{title}" }
-                span { class: "text-dim", style: "font-size: 11px; margin-left: 2px;", "{tr(keys::APP_VERSION, l)}" }
+                span { class: "small fw-semibold", style: "color: var(--bs-body-color);", "{title}" }
+                span { class: "small ms-1", style: "color: var(--bs-tertiary-color);", "{tr(keys::APP_VERSION, l)}" }
             }
 
             // Window controls
             div {
-                class: "titlebar-controls",
+                class: "d-flex align-items-center gap-2",
+                style: "pointer-events: all; -webkit-app-region: no-drag;",
                 onmousedown: move |evt| evt.stop_propagation(),
 
-                ThemeToggleBtn { theme, locale }
+                ThemeToggle { theme }
 
-                div { class: "titlebar-divider" }
+                div { style: "width: 1px; height: 16px; background: var(--bs-border-color); margin: 0 2px;" }
 
                 WinBtn {
                     icon: "⎯",
                     title: tr(keys::TITLE_MINIMIZE, l),
-                    color: t.text_sec,
                     onclick: move |_| w1.set_minimized(true),
                 }
                 WinBtn {
                     icon: "⛶",
                     title: tr(keys::TITLE_MAXIMIZE, l),
-                    color: t.text_sec,
                     onclick: move |_| {
                         let win: &dioxus::desktop::tao::window::Window = &**w2;
                         win.set_maximized(!win.is_maximized());
@@ -73,7 +74,7 @@ pub fn TitleBar(title: String, theme: Signal<Theme>, locale: Signal<String>) -> 
                 WinBtn {
                     icon: "✕",
                     title: tr(keys::TITLE_CLOSE, l),
-                    color: DARK.danger,
+                    danger: true,
                     onclick: move |_| w3.close(),
                 }
             }
@@ -81,117 +82,22 @@ pub fn TitleBar(title: String, theme: Signal<Theme>, locale: Signal<String>) -> 
     }
 }
 
-// ─── Theme dropdown ───────────────────────────────────────────────────────────
-
-#[component]
-pub fn ThemeToggleBtn(theme: Signal<Theme>, locale: Signal<String>) -> Element {
-    let mut open = use_signal(|| false);
-    let mut hovered = use_signal(|| false);
-    let t = tc(theme());
-    let l: &'static str = Box::leak(locale().into_boxed_str());
-
-    // Current theme icon
-    let cur_icon = THEME_ITEMS.iter()
-        .find(|(th, _, _)| *th == theme())
-        .map(|(_, icon, _)| *icon)
-        .unwrap_or("🌙");
-
-    let is_dark_bg = matches!(theme(), Theme::Dark | Theme::SkyBlue);
-    let bg = if hovered() || open() {
-        if is_dark_bg { "rgba(255,255,255,0.1)" } else { "rgba(0,0,0,0.06)" }
-    } else {
-        "transparent"
-    };
-
-    let toggle_open = move |evt: dioxus::events::MouseEvent| {
-        evt.stop_propagation();
-        open.set(!open());
-    };
-    let close_menu = move |_| open.set(false);
-
-    rsx! {
-        div {
-            class: "theme-dropdown-container",
-            onmouseenter: move |_| hovered.set(true),
-            onmouseleave: move |_| hovered.set(false),
-
-            // Trigger
-            div {
-                class: "theme-toggle",
-                style: "background: {bg};",
-                title: tr(keys::SETTINGS_THEME, l),
-                onclick: toggle_open,
-                "{cur_icon}"
-            }
-
-            // Dropdown menu + backdrop
-            if open() {
-                // Transparent backdrop — clicking outside closes the menu
-                div {
-                    class: "theme-dropdown-backdrop",
-                    onclick: close_menu,
-                }
-                {
-                    let current_theme = theme();
-                    let items: Vec<_> = THEME_ITEMS.iter().map(|(th, icon, key)| {
-                        let is_active = *th == current_theme;
-                        let item_bg = if is_active { "var(--accent-bg)" } else { "transparent" };
-                        let th_c = *th;
-                        let icon_c = *icon;
-                        let key_c = *key;
-                        rsx! {
-                            div {
-                                class: "theme-dropdown-item",
-                                style: "background: {item_bg}; color: {t.text_pri};",
-                                onclick: move |_| {
-                                    theme.set(th_c);
-                                    open.set(false);
-                                    let mut cfg = load_config();
-                                    cfg.theme = th_c;
-                                    save_config(&cfg);
-                                },
-                                span { class: "theme-dropdown-icon", "{icon_c}" }
-                                span { class: "theme-dropdown-label", "{tr(key_c, l)}" }
-                            }
-                        }
-                    }).collect();
-
-                    rsx! {
-                        div {
-                            class: "theme-dropdown-menu",
-                            style: "border-color: {t.border}; background: {t.bg_card};",
-                            onclick: move |evt| evt.stop_propagation(),
-                            {items.into_iter()}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ─── Generic window-chrome button ────────────────────────────────────────────
+// ─── Generic window-chrome button ───────────────────────────────────────────
 
 #[component]
 pub fn WinBtn(
     icon: &'static str,
     title: &'static str,
-    color: &'static str,
+    #[props(default = false)] danger: bool,
     onclick: EventHandler<()>,
 ) -> Element {
-    let mut hovered = use_signal(|| false);
-    let bg = if hovered() {
-        "rgba(255,255,255,0.08)"
-    } else {
-        "transparent"
-    };
     rsx! {
-        div {
-            class: "win-btn",
-            style: "color: {color}; background: {bg};",
-            title: title,
-            onmouseenter: move |_| hovered.set(true),
-            onmouseleave: move |_| hovered.set(false),
+        Button {
+            color: if danger { Color::Danger } else { Color::Secondary },
+            outline: true,
+            size: Size::Sm,
+            class: "border-0",
+            title,
             onclick: move |_| onclick.call(()),
             "{icon}"
         }

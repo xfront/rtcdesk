@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use dioxus::desktop::use_window;
 use dioxus::prelude::*;
+use dioxus_bootstrap_css::prelude::*;
 use tokio::sync::mpsc;
 
 use shared::frame;
@@ -19,7 +20,7 @@ use crate::config::load_config;
 use crate::i18n::{t as tr, tf};
 use crate::i18n::keys;
 use crate::quality::{ScaleMode, QUALITY_PRESETS};
-use crate::theme::{tc, Theme};
+use dioxus_bootstrap_css::theme::Theme;
 use crate::Page;
 use crate::WindowCmd;
 use crate::remote::file_transfer::{DropOverlay, FileTransferProgress, FileTransferState};
@@ -39,6 +40,7 @@ use crate::remote::viewer_loop::{run_viewer, GuiCallback, InputCmd, ViewerState}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionState {
+    #[allow(dead_code)]
     Idle,
     Connecting,
     Connected,
@@ -59,31 +61,31 @@ pub fn RemoteView(
     window_cmd:  Signal<Vec<crate::WindowCmd>>,
     is_fullscreen: Signal<bool>,
 ) -> Element {
-    let mut state            = use_signal(|| SessionState::Connecting);
-    let mut frame_b64        = use_signal(String::new);
-    let mut orig_w           = use_signal(|| frame::DEFAULT_FRAME_W);
-    let mut orig_h           = use_signal(|| frame::DEFAULT_FRAME_H);
-    let mut frame_w          = use_signal(|| frame::DEFAULT_FRAME_W);
-    let mut frame_h          = use_signal(|| frame::DEFAULT_FRAME_H);
+    let state            = use_signal(|| SessionState::Connecting);
+    let frame_b64        = use_signal(String::new);
+    let orig_w           = use_signal(|| frame::DEFAULT_FRAME_W);
+    let orig_h           = use_signal(|| frame::DEFAULT_FRAME_H);
+    let frame_w          = use_signal(|| frame::DEFAULT_FRAME_W);
+    let frame_h          = use_signal(|| frame::DEFAULT_FRAME_H);
     let mut toolbar_visible  = use_signal(|| true);
     let mut toolbar_pinned   = use_signal(|| false);
     let mut scale_mode       = use_signal(|| ScaleMode::Fit);
-    let mut quality_idx      = use_signal(|| quality());
+    let quality_idx      = use_signal(|| quality());
     let mut clipboard_synced = use_signal(|| false);
     let mut show_quality_menu = use_signal(|| false);
     let mut show_scale_menu   = use_signal(|| false);
-    let mut right_ctrl        = use_signal(|| false);
-    let mut local_clipboard   = use_signal(String::new);
+    let right_ctrl        = use_signal(|| false);
+    let local_clipboard   = use_signal(String::new);
     let mut viewer_input_tx      = use_signal(|| None::<mpsc::UnboundedSender<InputCmd>>);
     let mut viewer_quality_tx    = use_signal(|| None::<mpsc::UnboundedSender<usize>>);
     let mut viewer_disconnect_tx = use_signal(|| None::<mpsc::UnboundedSender<()>>);
     let mut viewer_clipboard_tx  = use_signal(|| None::<mpsc::UnboundedSender<String>>);
 
     let mut view_only        = use_signal(|| false);
-    let mut show_stats_detail = use_signal(|| false);
+    let show_stats_detail = use_signal(|| false);
     let mut is_dragging      = use_signal(|| false);
-    let mut stats            = use_signal(ConnectionStats::default);
-    let mut file_transfer    = use_signal(|| FileTransferState::Idle);
+    let stats            = use_signal(ConnectionStats::default);
+    let file_transfer    = use_signal(|| FileTransferState::Idle);
     let mut toast            = use_signal(|| None::<ToastMessage>);
     let mut viewer_file_send_tx = use_signal(|| None::<mpsc::UnboundedSender<crate::remote::viewer_loop::FileSendCmd>>);
 
@@ -143,13 +145,18 @@ pub fn RemoteView(
 
     rsx! {
         div {
-            class: "main-window",
-            if (!is_fullscreen()) { TitleBar { title: "RTCDesk", theme, locale } }
+            style: "display: flex; flex-direction: column; width: 100vw; height: 100vh;
+                    background: var(--bs-body-bg); border: 1px solid var(--bs-border-color);
+                    border-radius: 10px; overflow: hidden; user-select: none;
+                    color: var(--bs-body-color);",
+            if !is_fullscreen() { TitleBar { title: "RTCDesk", theme, locale } }
 
             div {
                 tabindex: 0,
-                class: "remote-container",
-                style: "cursor: {cursor_style};overflow: {container_overflow};justify-content: {container_justify};align-items: {container_justify};",
+                class: "w-100 flex-fill d-flex position-relative",
+                style: "min-height: 0; background: var(--bs-body-bg); outline: none;
+                        cursor: {cursor_style}; overflow: {container_overflow};
+                        justify-content: {container_justify}; align-items: {container_justify};",
                 onkeydown: move |evt| {
                     evt.prevent_default();
                     if handle_keydown_local(&evt, right_ctrl, view_only, window_cmd) { return; }
@@ -281,7 +288,7 @@ pub fn RemoteView(
                 ErrorOverlay { state, page, theme, locale, window_cmd }
             }
 
-            if (!is_fullscreen()) {
+            if !is_fullscreen() {
                 ResizeEdges {}
             }
         }
@@ -313,7 +320,7 @@ pub fn RemoteViewport(
     let (w1, w2, w3) = (window.clone(), window.clone(), window.clone());
     let img_css = image_style(scale_mode(), frame_w(), frame_h());
     let display_style = frame_display_style(scale_mode(), frame_w(), frame_h());
-    let t = tc(theme());
+    let _ts = theme();
 
     rsx! {
         div {
@@ -352,10 +359,13 @@ pub fn RemoteViewport(
 
             if !has_frame {
                 div {
-                    class: "text-pri",
-                    style: "text-align: center; padding: 60px 40px;",
+                    style: "text-align: center; padding: 60px 40px; color: var(--bs-body-color);",
                     div {
-                        class: "connecting-spinner",
+                        style: "width: 80px; height: 80px; margin: 0 auto 20px;
+                                border-radius: 50%; background: rgba(63,185,80,0.1);
+                                border: 2px solid rgba(63,185,80,0.3);
+                                display: flex; align-items: center; justify-content: center;
+                                font-size: 32px;",
                         "⌛"
                     }
                     div {
@@ -363,8 +373,7 @@ pub fn RemoteViewport(
                         "{tr(keys::REMOTE_CONNECTING, l)}"
                     }
                     div {
-                        class: "text-sec",
-                        style: "font-size: 13px;",
+                        style: "font-size: 13px; color: var(--bs-secondary-color);",
                         "{tr(keys::REMOTE_ESTABLISHING, l)}"
                     }
                 }
@@ -390,11 +399,16 @@ pub fn RemoteViewport(
                     let detail = if parts.len() > 1 { parts[1..].join("\n") } else { String::new() };
                     rsx! {
                         div {
-                            class: "stats-badge",
+                            class: "position-absolute d-flex flex-column gap-1",
+                            style: "bottom: 12px; right: 12px; background: rgba(15,17,22,0.85);
+                                    border: 1px solid rgba(63,185,80,0.4);
+                                    border-radius: 6px; padding: 4px 10px;
+                                    font-size: 11px; color: #3fb950;
+                                    backdrop-filter: blur(4px); cursor: pointer;",
                             onclick: move |_| show_stats_detail.set(!show_stats_detail()),
                             div {
-                                style: "display: flex; align-items: center; gap: 5px;",
-                                div { class: "stats-dot" }
+                                class: "d-flex align-items-center gap-1",
+                                div { style: "width: 6px; height: 6px; border-radius: 50%; background: #3fb950;" }
                                 if vo { "{compact_line}" } else { "{tr(keys::REMOTE_CONNECTED, l2)}" }
                             }
                             if show_stats_detail() {
@@ -429,26 +443,28 @@ pub fn ErrorOverlay(
     } else {
         String::new()
     };
-    let t = tc(theme());
+    let _ts = theme();
     let l: &'static str = Box::leak(locale().into_boxed_str());
 
     rsx! {
         div {
-            class: "error-overlay",
+            class: "position-absolute start-50 top-50 translate-middle text-center",
+            style: "background: var(--bs-tertiary-bg); border: 1px solid var(--bs-border-color);
+                    border-radius: 16px; padding: 32px 40px;
+                    box-shadow: 0 16px 48px rgba(0,0,0,0.6);
+                    z-index: 100; min-width: 300px;",
             div { style: "font-size: 40px; margin-bottom: 14px;", "⚠" }
             div {
-                class: "text-pri",
-                style: "font-size: 16px; font-weight: 600; margin-bottom: 8px;",
+                style: "font-size: 16px; font-weight: 600; margin-bottom: 8px; color: var(--bs-body-color);",
                 "{tr(keys::REMOTE_ERR_TITLE, l)}"
             }
-            div {
-                class: "text-danger",
-                style: "font-size: 13px; margin-bottom: 24px; max-width: 280px; line-height: 1.5;",
+            Alert {
+                color: Color::Danger,
+                class: "mb-3",
                 "{msg}"
             }
-            button {
-                class: "btn-primary-sm",
-                style: "padding: 10px 28px;",
+            Button {
+                color: Color::Primary,
                 onclick: move |_| {
                     window_cmd.write().push(WindowCmd::ExitFullscreen);
                     page.set(Page::Main);

@@ -1,13 +1,15 @@
 //! Settings tab: network config, display quality, theme, language, device identity, about.
+//! Refactored with dioxus-bootstrap-css components.
 
 use dioxus::prelude::*;
+use dioxus_bootstrap_css::prelude::*;
 
 use crate::config::{load_config, save_config};
 use crate::i18n::{t as tr};
 use crate::i18n::keys;
 use crate::local_id::{format_local_id, generate_local_id};
 use crate::quality::QUALITY_PRESETS;
-use crate::theme::{tc, Theme};
+use dioxus_bootstrap_css::theme::Theme;
 use crate::clipboard::set_system_clipboard;
 
 // ─── Settings tab ────────────────────────────────────────────────────────────
@@ -20,31 +22,22 @@ pub fn SettingsTab(
     locale: Signal<String>,
     local_id: Signal<String>,
 ) -> Element {
-    let _t = tc(theme());
     let l: &'static str = Box::leak(locale().into_boxed_str());
 
     rsx! {
-        div {
-            class: "page-narrow",
+        div { class: "p-4",
 
-            h2 {
-                class: "heading-lg",
-                "{tr(keys::SETTINGS_TITLE, l)}"
-            }
-            p {
-                class: "subtitle-compact",
-                "{tr(keys::SETTINGS_SUBTITLE, l)}"
-            }
+            h4 { class: "mb-2", "{tr(keys::SETTINGS_TITLE, l)}" }
+            p  { class: "text-secondary small mb-4", "{tr(keys::SETTINGS_SUBTITLE, l)}" }
 
-            SettingsSection { title: tr(keys::SETTINGS_NETWORK, l), theme,
+            SettingsSection { title: tr(keys::SETTINGS_NETWORK, l),
                 children: rsx! {
-                    FormField { label: tr(keys::SETTINGS_SIGNAL_ADDR, l), hint: tr(keys::SETTINGS_SIGNAL_HINT, l), theme,
-                        input {
+                    FormField { label: tr(keys::SETTINGS_SIGNAL_ADDR, l), hint: tr(keys::SETTINGS_SIGNAL_HINT, l),
+                        Input {
                             r#type: "text",
-                            class: "input",
                             placeholder: tr(keys::SETTINGS_PLACEHOLDER_HOST, l),
                             value: "{server_addr}",
-                            oninput: move |e| {
+                            oninput: move |e: FormEvent| {
                                 server_addr.set(e.value());
                                 let mut cfg = load_config();
                                 cfg.server_addr = server_addr();
@@ -53,25 +46,26 @@ pub fn SettingsTab(
                         }
                     }
 
-                    FormField { label: tr(keys::SETTINGS_STUN, l), hint: tr(keys::SETTINGS_STUN_HINT, l), theme,
-                        StunServersEditor { theme, locale }
+                    FormField { label: tr(keys::SETTINGS_STUN, l), hint: tr(keys::SETTINGS_STUN_HINT, l),
+                        StunServersEditor { locale }
                     }
                 }
             }
 
-            SettingsSection { title: tr(keys::SETTINGS_DISPLAY, l), theme,
+            SettingsSection { title: tr(keys::SETTINGS_DISPLAY, l),
                 children: rsx! {
-                    FormField { label: tr(keys::SETTINGS_QUALITY, l), hint: tr(keys::SETTINGS_QUALITY_HINT, l), theme,
-                        div {
-                            style: "display: flex; gap: 6px; flex-wrap: wrap;",
-                            for (idx, preset) in QUALITY_PRESETS.iter().enumerate() {
+                    FormField { label: tr(keys::SETTINGS_QUALITY, l), hint: tr(keys::SETTINGS_QUALITY_HINT, l),
+                        div { class: "d-flex gap-1 flex-wrap",
+                            for (idx, _preset) in QUALITY_PRESETS.iter().enumerate() {
                                 {
                                     let active = idx == quality().min(QUALITY_PRESETS.len() - 1);
                                     let translated = crate::i18n::quality_label(idx, l);
                                     rsx! {
-                                        button {
+                                        Button {
                                             key: "sq_{idx}",
-                                            class: if active { "selector-btn-md-active" } else { "selector-btn-md" },
+                                            color: if active { Color::Primary } else { Color::Secondary },
+                                            outline: !active,
+                                            size: Size::Sm,
                                             onclick: move |_| {
                                                 quality.set(idx);
                                                 let mut cfg = load_config();
@@ -86,51 +80,24 @@ pub fn SettingsTab(
                         }
                     }
 
-                    FormField { label: tr(keys::SETTINGS_THEME, l), hint: tr(keys::SETTINGS_THEME_HINT, l), theme,
-                        div {
-                            style: "display: flex; gap: 8px; flex-wrap: wrap;",
-                            for (th, label_key, icon) in [
-                                (Theme::Dark,       keys::SETTINGS_THEME_DARK,        "🌙"),
-                                (Theme::Light,      keys::SETTINGS_THEME_LIGHT,       "☀"),
-                                (Theme::SkyBlue,    keys::SETTINGS_THEME_SKY_BLUE,    "🔵"),
-                                (Theme::GrassGreen, keys::SETTINGS_THEME_GRASS_GREEN, "🌿"),
-                                (Theme::Orange,     keys::SETTINGS_THEME_ORANGE,      "🍊"),
-                                (Theme::Purple,     keys::SETTINGS_THEME_PURPLE,      "🟣"),
-                            ] {
-                                {
-                                    let active = theme() == th;
-                                    let label = tr(label_key, l);
-                                    rsx! {
-                                        button {
-                                            key: "{label}",
-                                            class: if active { "selector-btn-theme-active" } else { "selector-btn-theme" },
-                                            onclick: move |_| {
-                                                theme.set(th);
-                                                let mut cfg = load_config();
-                                                cfg.theme = th;
-                                                save_config(&cfg);
-                                            },
-                                            span { style: "font-size: 14px;", "{icon}" }
-                                            span { "{label}" }
-                                        }
-                                    }
-                                }
-                            }
+                    FormField { label: tr(keys::SETTINGS_THEME, l), hint: tr(keys::SETTINGS_THEME_HINT, l),
+                        div { class: "d-flex align-items-center gap-2",
+                            ThemeToggle { theme }
                         }
                     }
 
-                    // ── Language selector ──
-                    FormField { label: tr(keys::SETTINGS_LANG, l), hint: tr(keys::SETTINGS_LANG_HINT, l), theme,
-                        select {
-                            class: "select",
-                            value: "{locale}",
-                            onchange: move |e| {
+                    // Language selector
+                    FormField { label: tr(keys::SETTINGS_LANG, l), hint: tr(keys::SETTINGS_LANG_HINT, l),
+                        Select {
+                            value: locale(),
+                            onchange: move |e: dioxus::events::FormEvent| {
                                 let new_locale = e.value();
                                 locale.set(new_locale.clone());
                                 let mut cfg = load_config();
                                 cfg.locale = new_locale;
                                 save_config(&cfg);
                             },
+                            style: "max-width: 260px;",
                             for entry in crate::i18n::available_locales().to_vec() {
                                 option {
                                     key: "{entry.id}",
@@ -144,17 +111,19 @@ pub fn SettingsTab(
                 }
             }
 
-            SettingsSection { title: tr(keys::SETTINGS_DEVICE_ID, l), theme,
+            SettingsSection { title: tr(keys::SETTINGS_DEVICE_ID, l),
                 children: rsx! {
-                    FormField { label: tr(keys::SETTINGS_LOCAL_ID, l), hint: tr(keys::SETTINGS_LOCAL_ID_HINT, l), theme,
-                        div {
-                            style: "display: flex; gap: 8px; align-items: center;",
+                    FormField { label: tr(keys::SETTINGS_LOCAL_ID, l), hint: tr(keys::SETTINGS_LOCAL_ID_HINT, l),
+                        div { class: "d-flex gap-2 align-items-center",
                             div {
-                                class: "id-display-sm",
+                                class: "form-control fw-semibold",
+                                style: "max-width: 200px; color: var(--bs-success); letter-spacing: 2px;",
                                 "{format_local_id(&local_id())}"
                             }
-                            button {
-                                class: "btn-ghost",
+                            Button {
+                                color: Color::Secondary,
+                                outline: true,
+                                size: Size::Sm,
                                 title: tr(keys::SETTINGS_BTN_RESET_TOOLTIP, l),
                                 onclick: move |_| {
                                     let new_id = generate_local_id();
@@ -165,8 +134,10 @@ pub fn SettingsTab(
                                 },
                                 "{tr(keys::SETTINGS_BTN_RESET, l)}"
                             }
-                            button {
-                                class: "btn-outline-accent-md",
+                            Button {
+                                color: Color::Primary,
+                                outline: true,
+                                size: Size::Sm,
                                 onclick: move |_| {
                                     let _ = set_system_clipboard(&local_id());
                                 },
@@ -179,28 +150,25 @@ pub fn SettingsTab(
 
             super::auth::AuthSection { theme, locale }
 
-            SettingsSection { title: tr(keys::SETTINGS_ABOUT, l), theme,
+            SettingsSection { title: tr(keys::SETTINGS_ABOUT, l),
                 children: rsx! {
-                    div {
-                        style: "display: flex; align-items: center; gap: 14px; padding: 12px 0;",
+                    div { class: "d-flex align-items-center gap-3 py-2",
                         div {
-                            class: "about-icon",
+                            class: "d-flex align-items-center justify-content-center rounded-3 flex-shrink-0 fw-bold",
+                            style: "width: 42px; height: 42px; font-size: 20px;
+                                    background: linear-gradient(135deg, var(--bs-success) 0%, var(--accent-dim) 100%);
+                                    color: #fff;",
                             "R"
                         }
                         div {
+                            div { class: "fw-semibold", "RTCDesk" }
                             div {
-                                class: "text-pri",
-                                style: "font-size: 15px; font-weight: 600;",
-                                "RTCDesk"
-                            }
-                            div {
-                                class: "text-sec",
-                                style: "font-size: 12px; margin-top: 2px;",
+                                class: "text-secondary small mt-1",
                                 "{tr(keys::SETTINGS_ABOUT_VER, l)}"
                             }
                             div {
-                                class: "text-dim",
-                                style: "font-size: 11px; margin-top: 2px;",
+                                class: "small mt-1",
+                                style: "color: var(--bs-tertiary-color);",
                                 "{tr(keys::SETTINGS_ABOUT_STACK, l)}"
                             }
                         }
@@ -214,8 +182,7 @@ pub fn SettingsTab(
 // ─── Stun servers editor ─────────────────────────────────────────────────────
 
 #[component]
-fn StunServersEditor(theme: Signal<Theme>, locale: Signal<String>) -> Element {
-    let _t = tc(theme());
+fn StunServersEditor(locale: Signal<String>) -> Element {
     let loc = locale();
     let sh = tr(keys::SETTINGS_PLACEHOLDER_STUN, &loc);
     let hp = tr(keys::SETTINGS_STUN_HELP, &loc);
@@ -225,11 +192,9 @@ fn StunServersEditor(theme: Signal<Theme>, locale: Signal<String>) -> Element {
 
     rsx! {
         div {
-            class: "flex-col",
-            style: "gap: 8px; align-items: flex-start;",
             input {
+                class: "form-control",
                 r#type: "text",
-                class: "input",
                 placeholder: sh,
                 value: "{stun_input}",
                 oninput: move |e| stun_input.set(e.value()),
@@ -245,32 +210,26 @@ fn StunServersEditor(theme: Signal<Theme>, locale: Signal<String>) -> Element {
                 },
             }
             div {
-                class: "text-dim",
-                style: "font-size: 11px; line-height: 1.5;",
+                class: "small text-secondary mt-1",
                 "{hp}"
             }
         }
     }
 }
 
-// ─── Re-exported helpers ─────────────────────────────────────────────────────
+// ─── Settings section wrapper ─────────────────────────────────────────────────
 
 #[component]
 pub fn SettingsSection(
     title: &'static str,
-    theme: Signal<Theme>,
     children: Element,
 ) -> Element {
-    let _t = tc(theme());
     rsx! {
-        div {
-            class: "card-section",
-            style: "margin-bottom: 16px;",
-            div {
-                class: "card-section-header",
-                "{title}"
-            }
-            div { class: "card-section-body", {children} }
+        Card { class: "mb-3",
+            header: rsx! {
+                span { class: "text-secondary small text-uppercase fw-semibold", "{title}" }
+            },
+            body: rsx! { {children} }
         }
     }
 }
