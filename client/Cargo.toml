@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 rtcdesk-shared = { path = "../shared" }
-webrtc.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true
@@ -27,15 +26,25 @@ local-ip-address.workspace = true
 clipboard-rs.workspace = true
 base64.workspace = true
 keyboard-types.workspace = true
+webrtc.workspace = true
+rtc.workspace = true
+openh264.workspace = true
 dioxus = { version = "0.7" }
+dioxus-html = { version = "0.7" }
 dioxus-bootstrap-css = "0.3"
 image.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
-rfd = "0.15"
+rfd = "0.17"
+wry = "0.50"
+ffmpeg-sys-next = { version = "7.1", default-features = false, features = ["avcodec", "swscale"], optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
-default = ["desktop"]
+default = ["desktop", "vaapi"]
 web = ["dioxus/web"]
 desktop = ["dioxus/desktop"]
 mobile = ["dioxus/mobile"]
+
+# Decode backends
+vaapi = ["ffmpeg-sys-next", "libc"]

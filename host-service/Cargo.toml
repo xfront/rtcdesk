@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 rtcdesk-shared = { path = "../shared" }
 webrtc.workspace = true
+rtc.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true
@@ -28,7 +29,9 @@ image.workspace = true
 xcap.workspace = true
 enigo.workspace = true
 keyboard-types.workspace = true
+rand.workspace = true
 clipboard-rs.workspace = true
 local-ip-address.workspace = true
 dirs = "6"
-toml = "0.8"
+toml = "1"
+openh264.workspace = true

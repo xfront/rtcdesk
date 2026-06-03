@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["full"] }
 log = "0.4"
 base64 = "0.22"
 env_logger = "0.11"
-clipboard-rs = "0.2"
+clipboard-rs = "0.3"
 rustls = { version = "0.23", default-features = false, features = [
     "aws_lc_rs",
     "tls12",
@@ -24,6 +24,7 @@ rustls = { version = "0.23", default-features = false, features = [
 
 # ── server deps ───────────────────────────────────────────────────────
 webrtc = "=0.20.0-alpha.1"
+rtc = "=0.20.0-alpha.1"
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
     "connect",
     "__rustls-tls",
@@ -46,4 +47,6 @@ axum = { version = "0.8", features = ["ws"] }
 stunclient = { version = "0.4", features = ["async"] }
 local-ip-address = "0.6"
 enigo = "0.6"
-keyboard-types = "0.7"
+keyboard-types = "0.8"
+rand = "0.10"
+openh264 = "0.9"

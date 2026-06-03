@@ -1,7 +1,6 @@
 //! Keyboard event mapping and local hotkey handling.
 
 use dioxus::prelude::*;
-use keyboard_types::{Code, Key};
 
 use shared::frame;
 use crate::WindowCmd;

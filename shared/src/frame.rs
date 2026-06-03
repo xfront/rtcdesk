@@ -51,6 +51,9 @@ pub const TAG_MOUSE: u8 = 0x01;
 pub const TAG_KEY: u8 = 0x02;
 /// Wheel event tag byte.
 pub const TAG_WHEEL: u8 = 0x03;
+/// Viewer-ready signal (sent via input DC after decoder init).
+/// Wire format: `[0x10]`
+pub const TAG_VIEWER_READY: u8 = 0x10;
 
 /// Mouse event wire size: tag(1) + x(8) + y(8) + btn(1) + pressed(1).
 pub const MOUSE_EVENT_SIZE: usize = 19;
@@ -181,8 +184,10 @@ pub const DEFAULT_STUN: &str = "stun:stun.l.google.com:19302";
 pub const DEFAULT_FPS: u32 = 15;
 pub const DEFAULT_CAPTURE_DIM: u32 = 1280;
 pub const SIGNAL_STARTUP_DELAY_MS: u64 = 300;
-pub const DEFAULT_JPEG_QUALITY: u8 = 30;
-pub const DEFAULT_MAX_DIMENSION: u32 = 1920;
+/// Default picture quality hint sent in SDP negotiation.
+/// The host may use this to adjust capture resolution, but with
+/// raw-RGBA streaming it is purely informational.
+pub const DEFAULT_PIC_QUALITY: u32 = 55;
 pub const SIGNAL_BROADCAST_CAP: usize = 64;
 pub const STUN_QUERY_TIMEOUT_SECS: u64 = 40;
 

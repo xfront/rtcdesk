@@ -1,50 +1,46 @@
 //! Screen capture module for desktop sharing.
 //!
-//! Captures the host's screen at a configurable frame rate and
-//! encodes frames as JPEG for transmission over the data channel.
-//! JPEG lossy compression keeps frames around 30-60 KB for 720p,
-//! which fits in 2-4 SCTP chunks (vs. ~500 KB for PNG = 34 chunks).
-
+//! Uses xcap's `VideoRecorder` API to capture the host screen as a
+//! continuous RGBA frame stream.  Frames are received via an MPSC channel.
+//!
+//! Encoding is handled by the video track streaming loop in `peer.rs`,
+//! which converts RGBA → H.264 and sends RTP packets via WebRTC Video Track.
 
 use anyhow::{Context, Result};
-use image::{DynamicImage, ImageEncoder};
-use log::{debug, info};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::time::Duration;
-use xcap::Monitor;
-use shared::frame;
+use log::info;
+use std::sync::Mutex;
+use xcap::{Frame, Monitor, VideoRecorder};
 
 /// A single captured frame with metadata.
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
-    /// Encoded JPEG data.
+    /// Raw RGBA pixel data (width × height × 4 bytes).
     pub data: Vec<u8>,
-    /// Original (unscaled) monitor width — for accurate mouse coordinate mapping.
-    pub orig_width: u32,
-    /// Original (unscaled) monitor height.
-    pub orig_height: u32,
-    /// Frame width in pixels (may be ≤ orig_width if down-scaled).
+    /// Monitor width in pixels.
     pub width: u32,
-    /// Frame height in pixels (may be ≤ orig_height if down-scaled).
+    /// Monitor height in pixels.
     pub height: u32,
 }
 
-/// Screen capturer that periodically grabs desktop frames.
-/// All mutable config fields use atomics so they can be updated behind `Arc`.
+/// Screen capturer using xcap's VideoRecorder for continuous frame streaming.
+///
+/// The video recorder runs a background thread that pushes RGBA frames into
+/// an MPSC channel.  `capture_frame()` drains the channel to keep latency
+/// minimal and returns the latest frame.
 pub struct ScreenCapturer {
-    /// The monitor to capture.
+    /// The monitor being captured (retained for resolution queries).
     monitor: Monitor,
-    /// JPEG encoding quality (0-100), default 30.
-    jpeg_quality: AtomicU8,
-    /// Scale down frames whose width or height exceeds this value.
-    max_dimension: AtomicU32,
+    /// Video recorder controller (start/stop).
+    video_recorder: VideoRecorder,
+    /// Receiver end of the frame channel — drained per `capture_frame()` call.
+    frame_rx: Mutex<std::sync::mpsc::Receiver<Frame>>,
 }
 
 // xcap::Monitor does not implement Send + Sync on Windows because it holds
-// HMONITOR / DC handles.  All Monitor access happens inside `capture_frame()`
-// which is always called via `tokio::spawn_blocking` — each call internally
-// creates fresh GDI resources and the raw handles themselves are safe to
-// share across threads as long as they are not accessed concurrently.
+// HMONITOR / DC handles.  All Monitor access happens inside the
+// VideoRecorder's internal thread, and resolution() only reads static
+// properties — so the unsafe impl is safe as long as Monitor is never
+// accessed concurrently.
 #[cfg(not(target_os = "linux"))]
 unsafe impl Send for ScreenCapturer {}
 #[cfg(not(target_os = "linux"))]
@@ -52,124 +48,58 @@ unsafe impl Sync for ScreenCapturer {}
 
 impl ScreenCapturer {
     /// Create a new screen capturer for the primary monitor.
+    ///
+    /// Initialises the `VideoRecorder` and starts capturing immediately.
+    /// Frames are pushed into an internal MPSC channel and consumed
+    /// on demand by `capture_frame()`.
     pub fn new() -> Result<Self> {
         let monitors = Monitor::all().context("failed to enumerate monitors")?;
-
         let monitor = monitors
             .into_iter()
             .next()
             .context("no monitors detected")?;
 
-        Ok(Self {
-            monitor,
-            jpeg_quality: AtomicU8::new(frame::DEFAULT_JPEG_QUALITY),
-            max_dimension: AtomicU32::new(frame::DEFAULT_MAX_DIMENSION),
-        })
-    }
+        let (video_recorder, frame_rx) = monitor
+            .video_recorder()
+            .context("failed to create video recorder")?;
 
-    /// Set JPEG compression quality (0-100).
-    /// Lower = smaller file, worse quality. Recommended range: 60-85.
-    pub fn set_quality(&self, quality: u8) {
-        self.jpeg_quality
-            .store(quality.clamp(0, 100), Ordering::Relaxed);
-    }
+        video_recorder
+            .start()
+            .context("failed to start video recorder")?;
 
-    /// Set maximum dimension for scaling.
-    pub fn set_max_dimension(&self, dim: u32) {
-        self.max_dimension.store(dim, Ordering::Relaxed);
-    }
-
-    /// Read current JPEG quality.
-    pub fn quality(&self) -> u8 {
-        self.jpeg_quality.load(Ordering::Relaxed)
-    }
-
-    /// Read current max dimension.
-    pub fn max_dimension(&self) -> u32 {
-        self.max_dimension.load(Ordering::Relaxed)
-    }
-
-    /// Capture a single frame and encode as JPEG.
-    pub fn capture_frame(&self) -> Result<CapturedFrame> {
-        let t0 = std::time::Instant::now();
-
-        // xcap returns image::RgbaImage on Linux (X11)
-        let rgba = self
-            .monitor
-            .capture_image()
-            .context("failed to capture screen")?;
-        let t1 = t0.elapsed();
-
-        let (orig_width, orig_height) = (rgba.width(), rgba.height());
-        let max_dim = self.max_dimension.load(Ordering::Relaxed);
-        let mut dyn_image = DynamicImage::ImageRgba8(rgba);
-
-        // Scale down if too large (image::resize preserves aspect ratio)
-        if orig_width > max_dim || orig_height > max_dim {
-            dyn_image = dyn_image.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3);
-            debug!(
-                "Scaled frame from {}x{} to {}x{}",
-                orig_width,
-                orig_height,
-                dyn_image.width(),
-                dyn_image.height(),
-            );
-        }
-
-        // Convert RGBA → RGB (JPEG doesn't support alpha channel)
-        let rgb = dyn_image.to_rgb8();
-        let (frame_w, frame_h) = (rgb.width(), rgb.height());
-
-        let jpeg_q = self.jpeg_quality.load(Ordering::Relaxed);
-        // JPEG encode with configured quality
-        let mut buffer = std::io::Cursor::new(Vec::new());
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, jpeg_q);
-        encoder.write_image(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
-            image::ExtendedColorType::Rgb8,
-        )?;
-
-        let jpeg_data = buffer.into_inner();
-        let t3 = t0.elapsed();
-        let kb = jpeg_data.len() / 1024;
-        let is_scaled = frame_w != orig_width || frame_h != orig_height;
         info!(
-            "Capture: {}x{} → {}x{}{} → {} KB, X11={:.0}ms convert+encode={:.0}ms total={:.0}ms (JPEG Q={})",
-            orig_width, orig_height,
-            frame_w, frame_h,
-            if is_scaled { " (scaled)" } else { "" },
-            kb,
-            t1.as_millis(),
-            (t3 - t1).as_millis(),
-            t3.as_millis(),
-            jpeg_q,
+            "Video recorder started for {}x{}",
+            monitor.width().unwrap_or(0),
+            monitor.height().unwrap_or(0),
         );
 
-        Ok(CapturedFrame {
-            data: jpeg_data,
-            orig_width,
-            orig_height,
-            width: frame_w,
-            height: frame_h,
+        Ok(Self {
+            monitor,
+            video_recorder,
+            frame_rx: Mutex::new(frame_rx),
         })
     }
 
-    /// Start continuous capture, yielding frames at the given interval.
-    pub async fn capture_loop<F>(&self, interval: Duration, mut on_frame: F) -> Result<()>
-    where
-        F: FnMut(CapturedFrame) + Send,
-    {
-        let mut interval_timer = tokio::time::interval(interval);
-
-        loop {
-            interval_timer.tick().await;
-            match self.capture_frame() {
-                Ok(frame) => on_frame(frame),
-                Err(e) => log::warn!("Capture error: {}", e),
-            }
+    /// Capture the latest frame from the video recorder.
+    ///
+    /// Blocks until a frame arrives, then drains any backlog to return
+    /// the most recent frame (minimum latency).
+    /// The blocking nature is safe because this method is always called
+    /// inside `tokio::task::spawn_blocking`.
+    pub fn capture_frame(&self) -> Result<CapturedFrame> {
+        let rx = self.frame_rx.lock().unwrap();
+        let mut latest = rx
+            .recv()
+            .map_err(|e| anyhow::anyhow!("video frame recv error: {e}"))?;
+        while let Ok(f) = rx.try_recv() {
+            latest = f;
         }
+
+        Ok(CapturedFrame {
+            data: latest.raw,
+            width: latest.width,
+            height: latest.height,
+        })
     }
 
     /// Returns the monitor resolution.
@@ -177,5 +107,14 @@ impl ScreenCapturer {
         let w = self.monitor.width().unwrap_or(1920);
         let h = self.monitor.height().unwrap_or(1080);
         (w, h)
+    }
+}
+
+impl Drop for ScreenCapturer {
+    fn drop(&mut self) {
+        if let Err(e) = self.video_recorder.stop() {
+            log::warn!("Error stopping video recorder: {:?}", e);
+        }
+        info!("Video recorder stopped");
     }
 }

@@ -1,10 +1,11 @@
 //! 远程会话视图：RemoteView 根组件、RemoteViewport、ErrorOverlay、
 //! SessionState 枚举。
 //!
-//! Window operations (fullscreen / minimize / maximize) are NOT performed here.
-//! Instead, child components push `WindowCmd` messages to a global signal that
-//! is consumed by the root `app()` component.  This keeps window logic in one
-//! place and avoids passing `DesktopService` handles around.
+//! Video pipeline (pure Rust — no JavaScript WebRTC bridge):
+//!   host-service → WebRTC Video Track → webrtc-rs on_track
+//!   → RTP depacketize → H264 decode → JPEG → <img data-URL>
+//!
+//! Input/clipboard DataChannels are managed entirely in Rust.
 
 use std::sync::Arc;
 
@@ -62,9 +63,7 @@ pub fn RemoteView(
     is_fullscreen: Signal<bool>,
 ) -> Element {
     let state            = use_signal(|| SessionState::Connecting);
-    let frame_b64        = use_signal(String::new);
-    let orig_w           = use_signal(|| frame::DEFAULT_FRAME_W);
-    let orig_h           = use_signal(|| frame::DEFAULT_FRAME_H);
+    let frame_seq        = use_signal(|| 0u64);
     let frame_w          = use_signal(|| frame::DEFAULT_FRAME_W);
     let frame_h          = use_signal(|| frame::DEFAULT_FRAME_H);
     let mut toolbar_visible  = use_signal(|| true);
@@ -80,14 +79,13 @@ pub fn RemoteView(
     let mut viewer_quality_tx    = use_signal(|| None::<mpsc::UnboundedSender<usize>>);
     let mut viewer_disconnect_tx = use_signal(|| None::<mpsc::UnboundedSender<()>>);
     let mut viewer_clipboard_tx  = use_signal(|| None::<mpsc::UnboundedSender<String>>);
-
+    let mut viewer_file_send_tx = use_signal(|| None::<mpsc::UnboundedSender<crate::remote::viewer_loop::FileSendCmd>>);
     let mut view_only        = use_signal(|| false);
     let show_stats_detail = use_signal(|| false);
     let mut is_dragging      = use_signal(|| false);
     let stats            = use_signal(ConnectionStats::default);
     let file_transfer    = use_signal(|| FileTransferState::Idle);
     let mut toast            = use_signal(|| None::<ToastMessage>);
-    let mut viewer_file_send_tx = use_signal(|| None::<mpsc::UnboundedSender<crate::remote::viewer_loop::FileSendCmd>>);
 
     use_effect(move || {
         let srv  = server_addr();
@@ -96,7 +94,7 @@ pub fn RemoteView(
         let lid  = load_config().local_id;
         let qidx = quality_idx();
         let vs = ViewerState {
-            frame_b64, orig_w, orig_h, frame_w, frame_h,
+            frame_seq, frame_w, frame_h,
             state, local_clipboard, clipboard_synced, page,
             view_only, is_fullscreen, window_cmd, stats,
             file_transfer, toast,
@@ -134,7 +132,7 @@ pub fn RemoteView(
     });
 
     let q_name = QUALITY_PRESETS[quality_idx().min(QUALITY_PRESETS.len().saturating_sub(1))].1;
-    let has_frame = !frame_b64().is_empty();
+    let has_frame = frame_seq() > 0;
     let cursor_style =  if view_only() { "not-allowed" } else { "default" };
     let container_overflow = use_memo(move || {
         if scale_mode() == ScaleMode::Original { "auto" } else { "hidden" }
@@ -202,8 +200,8 @@ pub fn RemoteView(
                 },
 
                 RemoteViewport {
-                    state, frame_b64, orig_w, orig_h, frame_w, frame_h,
-                    scale_mode, has_frame, viewer_input_tx, theme, locale,
+                    state, frame_seq, frame_w, frame_h,
+                    scale_mode, viewer_input_tx, theme, locale,
                     view_only, is_fullscreen, stats, show_stats_detail,
                 }
                 DropOverlay { is_dragging, locale }
@@ -243,15 +241,12 @@ pub fn RemoteView(
                         }
                     },
                     on_screenshot: move |_| {
-                        let fb64 = frame_b64();
-                        let loc_val = locale();
-                        let l = &loc_val;
-                        match screenshot::save_screenshot(&fb64) {
+                        match screenshot::save_screenshot() {
                             Ok(path) => toast.set(Some(ToastMessage::success(
-                                tf(keys::REMOTE_SCREENSHOT_SAVED, l, &[("path", &path)])
+                                format!("截图已保存: {}", path)
                             ))),
                             Err(e) => toast.set(Some(ToastMessage::error(
-                                tf(keys::REMOTE_SCREENSHOT_FAILED, l, &[("e", &e.to_string())])
+                                format!("截图失败: {}", e)
                             ))),
                         }
                     },
@@ -300,13 +295,10 @@ pub fn RemoteView(
 #[component]
 pub fn RemoteViewport(
     state:           Signal<SessionState>,
-    frame_b64:       Signal<String>,
-    orig_w:          Signal<u32>,
-    orig_h:          Signal<u32>,
+    frame_seq:       Signal<u64>,
     frame_w:         Signal<u32>,
     frame_h:         Signal<u32>,
     scale_mode:      Signal<ScaleMode>,
-    has_frame:       bool,
     viewer_input_tx: Signal<Option<mpsc::UnboundedSender<InputCmd>>>,
     theme:           Signal<Theme>,
     locale:          Signal<String>,
@@ -321,7 +313,8 @@ pub fn RemoteViewport(
     let img_css = image_style(scale_mode(), frame_w(), frame_h());
     let display_style = frame_display_style(scale_mode(), frame_w(), frame_h());
     let _ts = theme();
-
+    let has_frame = frame_seq() > 0;
+    let frame_src = crate::frame_slot::frame_url(frame_seq());
     rsx! {
         div {
             style: "position:relative;{display_style}",
@@ -329,7 +322,7 @@ pub fn RemoteViewport(
                 if view_only() { return; }
                 handle_mouse_event(
                     &evt, MouseAction::Down, &w1,
-                    orig_w(), orig_h(), frame_w(), frame_h(),
+                    frame_w(), frame_h(), frame_w(), frame_h(),
                     scale_mode(), is_fullscreen(), viewer_input_tx(),
                 );
             },
@@ -337,7 +330,7 @@ pub fn RemoteViewport(
                 if view_only() { return; }
                 handle_mouse_event(
                     &evt, MouseAction::Up, &w2,
-                    orig_w(), orig_h(), frame_w(), frame_h(),
+                    frame_w(), frame_h(), frame_w(), frame_h(),
                     scale_mode(), is_fullscreen(), viewer_input_tx(),
                 );
             },
@@ -345,7 +338,7 @@ pub fn RemoteViewport(
                 if view_only() { return; }
                 handle_mouse_event(
                     &evt, MouseAction::Move, &w3,
-                    orig_w(), orig_h(), frame_w(), frame_h(),
+                    frame_w(), frame_h(), frame_w(), frame_h(),
                     scale_mode(), is_fullscreen(), viewer_input_tx(),
                 );
             },
@@ -357,9 +350,13 @@ pub fn RemoteViewport(
                 }
             },
 
-            if !has_frame {
+            if has_frame {
+                img { src: "{frame_src}", style: "{img_css}" }
+            } else {
                 div {
-                    style: "text-align: center; padding: 60px 40px; color: var(--bs-body-color);",
+                    style: "position: absolute; inset: 0; display: flex;
+                            flex-direction: column; align-items: center; justify-content: center;
+                            color: var(--bs-body-color);",
                     div {
                         style: "width: 80px; height: 80px; margin: 0 auto 20px;
                                 border-radius: 50%; background: rgba(63,185,80,0.1);
@@ -377,8 +374,6 @@ pub fn RemoteViewport(
                         "{tr(keys::REMOTE_ESTABLISHING, l)}"
                     }
                 }
-            } else {
-                img { src: "{frame_b64}", style: "{img_css}" }
             }
 
             if state() == SessionState::Connected && has_frame {
@@ -393,7 +388,6 @@ pub fn RemoteViewport(
                         ("w", &s.resolution_w.to_string()),
                         ("h", &s.resolution_h.to_string()),
                     ]);
-                    // split at first newline for compact/full display
                     let parts: Vec<&str> = stat_line.split('\n').collect();
                     let compact_line = parts.first().copied().unwrap_or("");
                     let detail = if parts.len() > 1 { parts[1..].join("\n") } else { String::new() };

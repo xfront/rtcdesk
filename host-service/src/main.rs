@@ -20,6 +20,7 @@
 //! - `RTCDESK_LOGIN_PASSWORD` — login password for signaling server (default: admin123)
 
 mod capture;
+mod encoder;
 mod peer;
 mod signal_client;
 
@@ -201,12 +202,14 @@ async fn init_host() -> Result<HostContext> {
     )
     .await?;
 
-    // Initialize screen capture
+    // Initialize screen capture (raw RGBA — H.264 encoding handled by video track).
     let capturer = ScreenCapturer::new()
         .map(|c| {
-            let (w, h) = c.resolution();
-            info!("Screen capturer: {}x{}", w, h);
-            c.set_max_dimension(frame::DEFAULT_CAPTURE_DIM);
+            info!(
+                "Screen capturer: {}x{} (H.264 via video track)",
+                c.resolution().0,
+                c.resolution().1,
+            );
             Arc::new(c)
         })
         .map_err(|e| warn!("Screen capturer init failed: {}", e))
@@ -569,7 +572,7 @@ async fn dispatch_host_message(
                 );
                 let p = peer.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = p.start_streaming("desktop", viewer_fps).await {
+                    if let Err(e) = p.start_streaming(viewer_fps).await {
                         error!("Streaming error: {}", e);
                     }
                 });
@@ -675,12 +678,13 @@ async fn setup_input_and_clipboard(
     peer: &Arc<RtcPeer>,
     viewer_id: &str,
 ) -> Result<()> {
-    let input_dc = peer.create_frame_channel("input").await?;
+    let input_dc = peer.create_data_channel("input").await?;
     let running = peer.running_flag();
     let input_peer_id = viewer_id.to_string();
-    peer::spawn_input_reader(input_dc, running.clone(), input_peer_id);
+    let viewer_ready = peer.viewer_ready_notify();
+    peer::spawn_input_reader(input_dc, running.clone(), input_peer_id, viewer_ready);
 
-    let clipboard_dc = peer.create_frame_channel("clipboard").await?;
+    let clipboard_dc = peer.create_data_channel("clipboard").await?;
     let clip_peer_id = viewer_id.to_string();
     let clip_dc_writer = clipboard_dc.clone();
     peer::spawn_clipboard_reader(clipboard_dc, running.clone(), clip_peer_id.clone());
@@ -730,9 +734,6 @@ async fn handle_connect(
     if let Some(c) = capturer {
         peer.attach_capturer(c.clone())?;
     }
-
-    let dc = peer.create_frame_channel("desktop").await?;
-    peer.set_frame_channel(dc);
 
     let peer = Arc::new(peer);
     setup_input_and_clipboard(&peer, viewer_id).await?;
@@ -851,7 +852,7 @@ async fn handle_remote_offer(
     );
     let p = peer.clone();
     tokio::spawn(async move {
-        if let Err(e) = p.start_streaming("desktop", viewer_fps).await {
+        if let Err(e) = p.start_streaming(viewer_fps).await {
             error!("Streaming error: {}", e);
         }
     });

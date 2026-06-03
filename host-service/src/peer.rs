@@ -1,7 +1,8 @@
 //! WebRTC peer connection management for RTCDesk.
 //!
 //! Handles establishing and maintaining WebRTC connections,
-//! screen frame transmission over data channels, and input event relay.
+//! H.264 video streaming over RTP (video track), and input event relay
+//! over data channels.
 //!
 //! Uses webrtc-rs 0.20 alpha API with sans-IO architecture.
 
@@ -10,6 +11,17 @@ use bytes::BytesMut;
 use clipboard_rs::{Clipboard, ClipboardContext, RustImageData, common::RustImage};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse};
 use log::{debug, error, info, warn};
+use rtc::interceptor::Registry;
+use rtc::media::Sample;
+use rtc::media_stream::MediaStreamTrack;
+use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
+use rtc::peer_connection::configuration::media_engine::{
+    MIME_TYPE_H264, MediaEngine,
+};
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RtpCodecKind,
+};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -17,8 +29,10 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
+use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+use webrtc::media_stream::track_local::TrackLocal;
 
 // ── Key code constants ─────────────────────────────────────────────────────
 use frame::{
@@ -35,6 +49,7 @@ use webrtc::peer_connection::{
 use shared::{frame, signal};
 use shared::signal::SignalMessage;
 use crate::capture::ScreenCapturer;
+use crate::encoder::VideoEncoder;
 
 /// Single global `enigo` instance — re‑using the same X11/Wayland connection is **required**
 /// so that modifier keys (Ctrl/Shift/Alt) remain active when the next key arrives.
@@ -128,13 +143,12 @@ impl PeerConnectionEventHandler for SignalingEventHandler {
         match event.candidate.to_json() {
             Ok(init) => {
                 if init.candidate.is_empty() {
-                    // End-of-candidates indicator; not an error.
                     info!("[{}] ICE candidate gathering complete", self.peer_id);
                     return;
                 }
                 let msg = SignalMessage::IceCandidate {
                     from: self.peer_id.clone(),
-                    to: String::new(), // Set by sender
+                    to: String::new(),
                     candidate: init.candidate,
                     sdp_mid: init.sdp_mid,
                     sdp_mline_index: init.sdp_mline_index,
@@ -174,6 +188,33 @@ impl PeerConnectionEventHandler for SignalingEventHandler {
         info!("[{}] Remote data channel received", self.peer_id);
     }
 }
+
+// ── H.264 codec registration helper ───────────────────────────────────────
+
+/// Build a MediaEngine with H.264 video codec registered at payload type 102.
+fn build_media_engine() -> Result<MediaEngine> {
+    let mut media_engine = MediaEngine::default();
+
+    let video_codec = RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line:
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                    .to_owned(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 102,
+        ..Default::default()
+    };
+
+    media_engine.register_codec(video_codec, RtpCodecKind::Video)?;
+    Ok(media_engine)
+}
+
+// ── RtcPeer ────────────────────────────────────────────────────────────────
+
 /// Manages a WebRTC peer connection for desktop sharing.
 pub struct RtcPeer {
     /// The underlying WebRTC peer connection.
@@ -182,8 +223,10 @@ pub struct RtcPeer {
     peer_id: String,
     /// Screen capturer for desktop frames.
     capturer: Option<Arc<ScreenCapturer>>,
-    /// Pre-created data channel for frame streaming (before offer).
-    frame_channel: Option<Arc<dyn DataChannel>>,
+    /// H.264 video track for RTP streaming (replaces DataChannel "desktop").
+    video_track: Option<Arc<TrackLocalStaticSample>>,
+    /// SSRC assigned to the video track (set at construction time).
+    video_ssrc: u32,
     /// Channel for sending ICE candidate signaling messages.
     ice_tx: tokio::sync::mpsc::UnboundedSender<SignalMessage>,
     /// Receiver end — call `take_ice_receiver()` to drain and forward candidates.
@@ -192,21 +235,30 @@ pub struct RtcPeer {
     connection_ready: Arc<tokio::sync::Notify>,
     /// Notified when the pre-created data channel is fully open.
     dc_ready: Arc<tokio::sync::Notify>,
+    /// Notified when the viewer signals it is ready (decoder initialized).
+    viewer_ready: Arc<tokio::sync::Notify>,
     /// Set to false by the event handler when peer disconnects.
     running: Arc<AtomicBool>,
     /// Current target FPS (updated dynamically via QualityUpdate).
     fps: Arc<AtomicU32>,
     /// Guard against calling pc.close() more than once (prevents double-close panic/crash).
     pc_closed: Arc<AtomicBool>,
+    /// Set to true to force the next encoded frame to be an IDR keyframe.
+    /// The streaming loop checks this flag before each encode and calls
+    /// `encoder.force_keyframe()` when set.  Reset to false after use.
+    force_keyframe: Arc<AtomicBool>,
 }
 
 impl RtcPeer {
     /// Create a new RTC peer (host mode) with desktop sharing capability.
+    /// Registers H.264 video codec and creates a video track that will carry
+    /// the encoded screen frames over RTP.
     pub async fn new_host(peer_id: &str, stun_servers: &[String]) -> Result<Self> {
         let config = build_configuration(stun_servers);
         let (ice_tx, ice_rx) = tokio::sync::mpsc::unbounded_channel();
         let connection_ready = Arc::new(tokio::sync::Notify::new());
         let dc_ready = Arc::new(tokio::sync::Notify::new());
+        let viewer_ready = Arc::new(tokio::sync::Notify::new());
         let running = Arc::new(AtomicBool::new(true));
 
         let handler = Arc::new(SignalingEventHandler::new(
@@ -216,32 +268,79 @@ impl RtcPeer {
             running.clone(),
         ));
 
+        // ── MediaEngine with H.264 codec ──────────────────────────────
+        let mut media_engine = build_media_engine()?;
+        let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+
+        let runtime = webrtc::runtime::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
+
         let pc = PeerConnectionBuilder::new()
             .with_configuration(config)
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
             .with_handler(handler)
+            .with_runtime(runtime)
             .with_udp_addrs(discover_udp_addrs())
             .build()
             .await
             .context("failed to build peer connection")?;
 
-        // Box it and wrap in Arc
         let pc: Box<dyn PeerConnection> = Box::new(pc);
-        let pc = Arc::from(pc);
+        let pc: Arc<dyn PeerConnection> = Arc::from(pc);
 
-        info!("[{}] Host peer connection created", peer_id);
+        // ── Create H.264 video track ──────────────────────────────────
+        let video_ssrc: u32 = rand::random::<u32>();
+
+        let video_codec = RTCRtpCodec {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line:
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                    .to_owned(),
+            rtcp_feedback: vec![],
+        };
+
+        let video_track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
+            format!("desktop-stream-{peer_id}"),
+            format!("desktop-track-{peer_id}"),
+            format!("Desktop ({peer_id})"),
+            RtpCodecKind::Video,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(video_ssrc),
+                    ..Default::default()
+                },
+                codec: video_codec,
+                ..Default::default()
+            }],
+        ))?);
+
+        // add_track attaches the video track to the peer connection.
+        // This must be done BEFORE create_offer so the SDP includes it.
+        pc.add_track(video_track.clone() as Arc<dyn TrackLocal>).await?;
+
+        info!(
+            "[{}] Host peer connection created with H.264 video track (SSRC={})",
+            peer_id, video_ssrc,
+        );
 
         Ok(Self {
             peer_connection: pc,
             peer_id: peer_id.to_string(),
             capturer: None,
-            frame_channel: None,
+            video_track: Some(video_track),
+            video_ssrc,
             ice_tx,
             ice_rx: Some(ice_rx),
             connection_ready,
             dc_ready,
+            viewer_ready,
             running,
             fps: Arc::new(AtomicU32::new(frame::DEFAULT_FPS)),
             pc_closed: Arc::new(AtomicBool::new(false)),
+            force_keyframe: Arc::new(AtomicBool::new(true)), // Force IDR on first frame
         })
     }
 
@@ -257,48 +356,58 @@ impl RtcPeer {
         self.running.clone()
     }
 
+    /// Request the next encoded frame to be an IDR keyframe.
+    ///
+    /// This is used to respond to client keyframe requests (PLI/FIR)
+    /// or to periodically refresh the stream so new viewers can decode.
+    pub fn request_keyframe(&self) {
+        self.force_keyframe.store(true, Ordering::Relaxed);
+    }
+
+    /// Signal that the viewer has finished initializing its decoder
+    /// and is ready to receive video frames.
+    pub fn notify_viewer_ready(&self) {
+        self.viewer_ready.notify_waiters();
+    }
+
+    /// Get a reference to the viewer-ready signal.
+    /// The input reader uses this to notify streaming when the
+    /// viewer sends TAG_VIEWER_READY.
+    pub fn viewer_ready_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.viewer_ready.clone()
+    }
+
     /// Extract capturer parameters from a remote SDP (Offer or Answer)
     /// and apply them to the attached `ScreenCapturer`.
     pub fn apply_capturer_params_from_sdp(&self, sdp: &str) {
         let params = signal::extract_capturer_params_from_sdp(sdp);
-        if params.pic_quality.is_none() && params.max_dimension.is_none() {
-            return; // No custom attributes → keep defaults
+        if let Some(q) = params.pic_quality {
+            info!(
+                "[{}] Remote pic_quality={} (info only)",
+                self.peer_id, q
+            );
         }
-        if let Some(ref c) = self.capturer {
-            if let Some(q) = params.pic_quality {
-                let q8 = q.clamp(0, 100) as u8;
-                info!(
-                    "[{}] Applying pic_quality={} from remote SDP",
-                    self.peer_id, q8
-                );
-                c.set_quality(q8);
-            }
-            if let Some(d) = params.max_dimension {
-                info!(
-                    "[{}] Applying max_dimension={} from remote SDP",
-                    self.peer_id, d
-                );
-                c.set_max_dimension(d);
-            }
-            if let Some(f) = params.fps {
-                info!(
-                    "[{}] Remote requested fps={} (applied at stream start)",
-                    self.peer_id, f
-                );
-            }
+        if let Some(d) = params.max_dimension {
+            info!(
+                "[{}] Remote max_dimension={} (info only)",
+                self.peer_id, d
+            );
+        }
+        if let Some(f) = params.fps {
+            info!(
+                "[{}] Remote requested fps={} (applied at stream start)",
+                self.peer_id, f
+            );
         }
     }
 
-    /// Update quality, resolution, and FPS dynamically during an active session.
-    /// Atomic writes ensure the stream loop picks up the changes immediately.
+    /// Update FPS dynamically during an active session.
     pub fn update_quality(&self, quality: u32, max_dimension: u32, fps: u32) {
-        if let Some(ref c) = self.capturer {
-            c.set_quality(quality.clamp(0, 100) as u8);
-            c.set_max_dimension(max_dimension);
+        if self.capturer.is_some() {
             self.fps.store(fps.max(1), Ordering::Relaxed);
             info!(
-                "[{}] Quality updated: quality={} dim={} fps={}",
-                self.peer_id, quality, max_dimension, fps
+                "[{}] FPS updated to {} (quality={} dim={} ignored)",
+                self.peer_id, fps, quality, max_dimension
             );
         } else {
             warn!("[{}] No capturer; quality update ignored", self.peer_id);
@@ -329,10 +438,8 @@ impl RtcPeer {
             .set_local_description(offer.clone())
             .await?;
 
-        // ICE gathering is automatic - we'll receive candidates via handler
-        // The local description is set; ICE candidates flow through the handler
-
-        info!("[{}] Created offer", self.peer_id);
+        // Log SDP to debug SSRC/codec issues
+        info!("[{}] Offer SDP:\n{}", self.peer_id, offer.sdp);
         Ok(offer)
     }
 
@@ -387,8 +494,8 @@ impl RtcPeer {
         &self.peer_id
     }
 
-    /// Create a data channel for sending desktop frames.
-    pub async fn create_frame_channel(&self, label: &str) -> Result<Arc<dyn DataChannel>> {
+    /// Create a data channel for non-video traffic (input, clipboard).
+    pub async fn create_data_channel(&self, label: &str) -> Result<Arc<dyn DataChannel>> {
         let dc = self
             .peer_connection
             .create_data_channel(label, Some(RTCDataChannelInit::default()))
@@ -397,115 +504,72 @@ impl RtcPeer {
         Ok(dc)
     }
 
-    /// Set a pre-created frame channel. Must be created before `create_offer`
-    /// so that the offer SDP includes the data channel media section.
-    pub fn set_frame_channel(&mut self, dc: Arc<dyn DataChannel>) {
-        let dc_ready = self.dc_ready.clone();
-        let dc_clone = dc.clone();
-        // Poll for OnOpen event to detect when the data channel is fully
-        // open (DTLS/SCTP negotiation complete). on_open() is not available
-        // on Arc<dyn DataChannel> in webrtc 0.20 alpha, so we poll instead.
-        tokio::spawn(async move {
-            let mut opened = false;
-            loop {
-                match dc_clone.poll().await {
-                    Some(DataChannelEvent::OnOpen) => {
-                        if !opened {
-                            info!("Data channel fully open (DTLS/SCTP complete)");
-                            dc_ready.notify_waiters();
-                            opened = true;
-                        }
-                        // Keep polling to drain OnBufferedAmountLow etc.
-                        // and prevent the driver's event queue from overflowing.
-                    }
-                    Some(DataChannelEvent::OnClose) | Some(DataChannelEvent::OnError) => {
-                        warn!("Data channel closed/errored");
-                        break;
-                    }
-                    None => {
-                        tokio::time::sleep(Duration::from_millis(frame::DC_OPEN_POLL_MS)).await;
-                    }
-                    _ => {
-                        // Drain OnBufferedAmountLow and other events.
-                    }
-                }
-            }
-        });
-        self.frame_channel = Some(dc);
-    }
-
-    /// Start streaming desktop frames over the data channel.
-    /// Waits for the ICE connection to be established before creating the data channel.
-    pub async fn start_streaming(&self, channel_label: &str, initial_fps: u32) -> Result<()> {
+    /// Start streaming desktop frames over the video track.
+    /// Waits for the ICE connection to be established, then spawns an
+    /// encoding loop that captures RGBA → H.264 → RTP samples.
+    pub async fn start_streaming(&self, initial_fps: u32) -> Result<()> {
         let capturer = self
             .capturer
             .as_ref()
             .context("no capturer attached")?
             .clone();
 
-        // Store initial FPS; future QualityUpdate messages will update this atomically
-        self.fps
-            .store(initial_fps.max(1), Ordering::Relaxed);
+        let video_track = self
+            .video_track
+            .as_ref()
+            .context("no video track")?
+            .clone();
+
+        let video_ssrc = self.video_ssrc;
+
+        self.fps.store(initial_fps.max(1), Ordering::Relaxed);
 
         // Wait for ICE connection to be established (with timeout)
         tokio::select! {
             _ = self.connection_ready.notified() => {
-                info!("[{}] ICE connection established, starting stream", self.peer_id);
+                info!("[{}] ICE connection established", self.peer_id);
             }
             _ = tokio::time::sleep(Duration::from_secs(frame::ICE_TIMEOUT_SECS)) => {
                 warn!("[{}] Timed out waiting for ICE connection, starting anyway", self.peer_id);
             }
         }
 
-        // Use pre-created channel if available, otherwise create one
-        let dc = match &self.frame_channel {
-            Some(dc) => {
-                info!(
-                    "[{}] Using pre-created data channel: {}",
-                    self.peer_id, channel_label
-                );
-                dc.clone()
+        // Wait for the viewer to signal that its decoder is ready.
+        // This prevents sending SPS/PPS/IDR frames before the client
+        // has initialized its decoder, which would cause the keyframe
+        // to be lost and the stream to start with decode errors.
+        info!("[{}] Waiting for viewer to signal ready...", self.peer_id);
+        tokio::select! {
+            _ = self.viewer_ready.notified() => {
+                info!("[{}] Viewer ready, starting stream", self.peer_id);
             }
-            None => self.create_frame_channel(channel_label).await?,
-        };
-
-        // Wait for the data channel to be fully open (DTLS/SCTP negotiation complete)
-        if self.frame_channel.is_some() {
-            tokio::select! {
-                _ = self.dc_ready.notified() => {
-                    info!("[{}] Data channel open, ready to stream", self.peer_id);
-                }
-                _ = tokio::time::sleep(Duration::from_secs(frame::DC_OPEN_TIMEOUT_SECS)) => {
-                    warn!("[{}] Timed out waiting for data channel to open, streaming anyway", self.peer_id);
-                }
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                warn!("[{}] Timed out waiting for viewer ready, starting anyway", self.peer_id);
             }
         }
 
         let dynamic_fps = self.fps.clone();
+        let (w, h) = capturer.resolution();
         info!(
-            "[{}] Starting desktop stream at {} fps",
-            self.peer_id, initial_fps
+            "[{}] Starting H.264 video stream {}x{} @ {} fps via video track",
+            self.peer_id, w, h, initial_fps,
         );
 
         let peer_id = self.peer_id.clone();
         let running = self.running.clone();
         let pc = self.peer_connection.clone();
         let pc_closed = self.pc_closed.clone();
+        let force_keyframe = self.force_keyframe.clone();
         tokio::spawn(async move {
-            run_stream_loop(capturer, dc, dynamic_fps, running, pc, pc_closed).await;
-            info!("[{}] Streaming loop ended", peer_id);
+            run_video_stream_loop(capturer, video_track, video_ssrc, dynamic_fps, running, pc, pc_closed, force_keyframe).await;
+            info!("[{}] Video streaming loop ended", peer_id);
         });
 
         Ok(())
     }
 
     /// Close the peer connection.
-    /// Sets `running = false` first so spawned tasks (input/clipboard
-    /// readers, stream loop) detect the shutdown and exit gracefully.
-    /// Uses an atomic guard to prevent double-close.
     pub async fn close(&self) -> Result<()> {
-        // Prevent double-close (can happen when both the stream loop and the
-        // host cleanup try to close the same peer connection concurrently).
         if self.pc_closed.swap(true, Ordering::SeqCst) {
             info!(
                 "[{}] Peer connection already closed, skipping",
@@ -513,10 +577,7 @@ impl RtcPeer {
             );
             return Ok(());
         }
-        // Signal all spawned tasks to stop BEFORE closing the peer connection,
-        // so they don't keep polling a closing data channel.
         self.running.store(false, Ordering::Relaxed);
-        // Close with a timeout to prevent hanging on a stuck peer connection.
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
             self.peer_connection.close(),
@@ -542,84 +603,207 @@ impl RtcPeer {
     }
 }
 
-/// Core streaming loop: capture frames, chunk, send over data channel.
-/// FPS is read atomically each iteration so quality updates take effect immediately.
-async fn run_stream_loop(
+// ── Video streaming loop ──────────────────────────────────────────────────
+
+/// Captures RGBA frames, encodes them to H.264, and writes them as RTP
+/// samples to the video track.
+///
+/// Frame pacing is driven by the target FPS.  The encoder is created at
+/// the start of the stream and reused for the entire session.
+///
+/// Keyframe strategy:
+/// - The first frame is always an IDR (encoder starts in "force keyframe" mode).
+/// - After that, an IDR is forced every `KEYFRAME_INTERVAL` (3 seconds) so that
+///   a newly-connected or recovering viewer can start decoding.
+/// - External callers can also request a keyframe via `RtcPeer::request_keyframe()`.
+const KEYFRAME_INTERVAL_SECS: u64 = 1;
+
+async fn run_video_stream_loop(
     capturer: Arc<ScreenCapturer>,
-    dc: Arc<dyn DataChannel>,
+    video_track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
     fps: Arc<AtomicU32>,
     running: Arc<AtomicBool>,
     pc: Arc<dyn PeerConnection>,
     pc_closed: Arc<AtomicBool>,
+    force_keyframe: Arc<AtomicBool>,
 ) {
-    let frame_counter = Arc::new(AtomicU32::new(0));
+    let (w, h) = capturer.resolution();
+
+    // Create encoder at the initial FPS; it will be recreated if FPS changes
+    // significantly (rare — QualityUpdate typically only changes FPS).
+    let initial_fps = fps.load(Ordering::Relaxed).max(1);
+    let mut encoder = match VideoEncoder::new(w, h, initial_fps) {
+        Ok(enc) => enc,
+        Err(e) => {
+            error!("Failed to create H.264 encoder: {e}");
+            return;
+        }
+    };
+    let mut current_encoder_fps = initial_fps;
+
+    // Use interval-based pacing (pattern from webrtc-rs play-from-disk-h26x).
+    // This avoids skew accumulation compared to plain sleep.
+    let mut ticker =
+        tokio::time::interval(Duration::from_secs_f64(1.0 / initial_fps as f64));
+    let mut frame_duration = Duration::from_secs_f64(1.0 / initial_fps as f64);
+    let mut frame_seq: u64 = 0;
+    let mut last_rtp_log = tokio::time::Instant::now();
+    let mut last_keyframe_time = Instant::now();
+    let mut consecutive_write_errors: u32 = 0;
+
     loop {
         if !running.load(Ordering::Relaxed) {
-            info!("Peer disconnected, stopping stream");
+            info!("Peer disconnected, stopping video stream");
             break;
         }
-        let frame_start = tokio::time::Instant::now();
 
         let current_fps = fps.load(Ordering::Relaxed).max(1);
-        let interval = Duration::from_millis((1000 / current_fps) as u64);
 
+        // Recreate encoder and ticker if FPS changed by more than 25%
+        let fps_diff = (current_fps as i64 - current_encoder_fps as i64).unsigned_abs();
+        if fps_diff > current_encoder_fps as u64 / 4 {
+            info!(
+                "FPS changed from {} to {}, recreating encoder",
+                current_encoder_fps, current_fps,
+            );
+            encoder.shutdown();
+            match VideoEncoder::new(w, h, current_fps) {
+                Ok(enc) => {
+                    encoder = enc;
+                    current_encoder_fps = current_fps;
+                    frame_duration = Duration::from_secs_f64(1.0 / current_fps as f64);
+                    ticker =
+                        tokio::time::interval(frame_duration);
+                    // Consume the first immediate tick
+                    ticker.tick().await;
+                    // Force IDR after encoder recreation so the decoder
+                    // can resynchronise with the new stream parameters.
+                    force_keyframe.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error!("Failed to recreate encoder: {e}");
+                    break;
+                }
+            }
+        }
+
+        // ── Force keyframe if requested or if interval elapsed ──────────
+        let need_keyframe = force_keyframe.swap(false, Ordering::Relaxed)
+            || last_keyframe_time.elapsed() >= Duration::from_secs(KEYFRAME_INTERVAL_SECS);
+        if need_keyframe {
+            encoder.force_keyframe();
+            last_keyframe_time = Instant::now();
+        }
+
+        // ── Capture raw RGBA frame (CPU-bound → spawn_blocking) ────────
         let c = capturer.clone();
         let frame_result = tokio::task::spawn_blocking(move || c.capture_frame()).await;
         let frame = match frame_result {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => {
-                warn!("Frame capture error: {}", e);
+                warn!("Frame capture error: {e}");
                 continue;
             }
             Err(join_err) => {
-                error!("Capture thread panicked: {}", join_err);
+                error!("Capture thread panicked: {join_err}");
                 break;
             }
         };
 
-        let fid = frame_counter.fetch_add(1, Ordering::Relaxed);
-        let mut payload = Vec::with_capacity(frame::FRAME_HDR_SIZE + frame.data.len());
-        // Extended header: [orig_w:u32 BE][orig_h:u32 BE][frame_w:u32 BE][frame_h:u32 BE]
-        payload.extend_from_slice(&frame.orig_width.to_be_bytes());
-        payload.extend_from_slice(&frame.orig_height.to_be_bytes());
-        payload.extend_from_slice(&frame.width.to_be_bytes());
-        payload.extend_from_slice(&frame.height.to_be_bytes());
-        payload.extend_from_slice(&frame.data);
+        // ── Encode RGBA → H.264 ───────────────────────────────────────
+        let encoded = match encoder.encode(&frame.data) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("H.264 encode error: {e}");
+                continue;
+            }
+        };
 
-        let chunks = frame::chunk_frame(fid, &payload);
-        let total = chunks.len();
-        let mut send_ok = true;
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            match dc.send(BytesMut::from(&chunk[..])).await {
-                Ok(()) => {}
-                Err(e) => {
-                    error!("Failed to send frame chunk {}/{}: {}", i + 1, total, e);
-                    send_ok = false;
-                    break;
+        // Skip empty encodes (OpenH264 returns 0 bytes for "skip" frames
+        // where the previous frame can be reused).
+        if encoded.is_empty() {
+            let _ = ticker.tick().await;
+            continue;
+        }
+
+        // Log NAL types for first few encoded frames to verify IDR generation
+        if frame_seq < 5 {
+            let mut nal_info = Vec::new();
+            let mut pos = 0;
+            while pos + 4 < encoded.len() {
+                if encoded[pos..].starts_with(&[0x00, 0x00, 0x00, 0x01]) {
+                    let nal_type = encoded[pos + 4] & 0x1F;
+                    let nal_name = match nal_type {
+                        1 => "non-IDR", 5 => "IDR", 6 => "SEI",
+                        7 => "SPS", 8 => "PPS", 9 => "AUD", _ => "other",
+                    };
+                    nal_info.push(format!("{}(type={})", nal_name, nal_type));
+                    pos += 4;
+                } else if encoded[pos..].starts_with(&[0x00, 0x00, 0x01]) {
+                    let nal_type = encoded[pos + 3] & 0x1F;
+                    let nal_name = match nal_type {
+                        1 => "non-IDR", 5 => "IDR", 6 => "SEI",
+                        7 => "SPS", 8 => "PPS", 9 => "AUD", _ => "other",
+                    };
+                    nal_info.push(format!("{}(type={})", nal_name, nal_type));
+                    pos += 3;
+                } else {
+                    pos += 1;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(frame::INTER_CHUNK_DELAY_MS)).await;
-        }
-        if !send_ok {
-            break;
+            info!("Encoded frame #{}: {} bytes, NALs: [{}]", frame_seq, encoded.len(), nal_info.join(", "));
         }
 
-        let elapsed = frame_start.elapsed();
-        if elapsed < interval {
-            tokio::time::sleep(interval - elapsed).await;
+        // ── Write H.264 NAL units as RTP sample ───────────────────────
+        let encodedlen = encoded.len();
+        let sample_writer = video_track.sample_writer(ssrc);
+        if let Err(e) = sample_writer
+            .write_sample(&Sample {
+                data: bytes::Bytes::from(encoded),
+                duration: frame_duration,
+                ..Default::default()
+            })
+            .await
+        {
+            consecutive_write_errors += 1;
+            if consecutive_write_errors >= 3 {
+                warn!("Sample write failed {} times, peer likely disconnected", consecutive_write_errors);
+                break;
+            }
+            warn!("Sample write error ({}/3)", consecutive_write_errors);
+        } else {
+            consecutive_write_errors = 0;
         }
+
+        frame_seq += 1;
+        // Periodic log to confirm streaming is active
+        if last_rtp_log.elapsed() >= std::time::Duration::from_secs(3) {
+            info!(
+                "Host streaming: wrote {} frames ({} bytes last) in 3s",
+                frame_seq,
+                encodedlen,
+            );
+            last_rtp_log = tokio::time::Instant::now();
+        }
+
+        // ── Frame pacing (interval-based, avoids skew) ────────────────
+        let _ = ticker.tick().await;
     }
-    // Only close if not already closed (e.g. by RtcPeer::close() from the
-    // host cleanup path). Data channel send failures also end up here and
-    // should trigger a graceful PC close.
+
+    // Clean up encoder
+    encoder.shutdown();
+
     if !pc_closed.swap(true, Ordering::SeqCst) {
         running.store(false, Ordering::Relaxed);
-        info!("Stream loop closing peer connection");
+        info!("Video stream loop closing peer connection");
         if let Err(e) = pc.close().await {
-            error!("Stream loop peer_connection.close() error: {}", e);
+            error!("Video stream peer_connection.close() error: {e}");
         }
     }
 }
+
+// ── Configuration ─────────────────────────────────────────────────────────
 
 /// Build a WebRTC configuration with STUN servers.
 /// Falls back to a well-known public STUN server when none are configured,
@@ -650,13 +834,18 @@ fn build_configuration(stun_servers: &[String]) -> RTCConfiguration {
 
 /// Spawn a task that polls the `"input"` data channel and dispatches
 /// received mouse / keyboard events to the OS via `enigo`.
-pub fn spawn_input_reader(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>, peer_id: String) {
+/// When the viewer sends `TAG_VIEWER_READY`, notifies the peer so
+/// that streaming can begin.
+pub fn spawn_input_reader(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>, peer_id: String, viewer_ready: Arc<tokio::sync::Notify>) {
     tokio::spawn(async move {
         info!("[{}] Input reader started", peer_id);
         while running.load(Ordering::Relaxed) {
             match dc.poll().await {
                 Some(DataChannelEvent::OnMessage(msg)) => {
-                    dispatch_input(&msg.data, &peer_id);
+                    let tag = dispatch_input(&msg.data, &peer_id);
+                    if tag == Some(frame::TAG_VIEWER_READY) {
+                        viewer_ready.notify_waiters();
+                    }
                 }
                 Some(DataChannelEvent::OnClose) | Some(DataChannelEvent::OnError) => {
                     info!("[{}] Input channel closed", peer_id);
@@ -673,9 +862,9 @@ pub fn spawn_input_reader(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>, pe
 }
 
 /// Route a binary input payload to the correct handler.
-fn dispatch_input(data: &[u8], peer_id: &str) {
+fn dispatch_input(data: &[u8], peer_id: &str) -> Option<u8> {
     if data.is_empty() {
-        return;
+        return None;
     }
     let tag = data[0];
     info!(
@@ -686,8 +875,13 @@ fn dispatch_input(data: &[u8], peer_id: &str) {
         frame::TAG_MOUSE => dispatch_mouse(data, peer_id),
         frame::TAG_KEY => dispatch_key(data, peer_id),
         frame::TAG_WHEEL => dispatch_wheel(data, peer_id),
+        frame::TAG_VIEWER_READY => {
+            info!("[{}] Received VIEWER_READY signal", peer_id);
+            return Some(frame::TAG_VIEWER_READY);
+        }
         _ => warn!("[{}] Unknown input event type: 0x{:02X}", peer_id, data[0]),
     }
+    None
 }
 
 /// Parse a mouse event and simulate it via `enigo`.
@@ -710,14 +904,16 @@ fn dispatch_mouse(data: &[u8], peer_id: &str) {
     let button = data[frame::MOUSE_BTN_OFF];
     let pressed = data[frame::MOUSE_PRESSED_OFF] == 1;
 
-    info!(
-        "[{}] Mouse: ({:.0}, {:.0}) btn={} {}",
-        peer_id,
-        x,
-        y,
-        button,
-        if pressed { "down" } else { "up" }
-    );
+    if button == frame::BTN_LEFT {
+        info!(
+            "[{}] Mouse: ({:.0}, {:.0}) btn={} {}",
+            peer_id,
+            x,
+            y,
+            button,
+            if pressed { "down" } else { "up" }
+        );
+    }
 
     match ENIGO.lock() {
         Ok(ref mut enigo) => {
@@ -770,12 +966,7 @@ fn dispatch_wheel(data: &[u8], peer_id: &str) {
             .try_into()
             .unwrap_or_default(),
     );
-
-    debug!(
-        "[{}] Wheel: dx={} dy={}",
-        peer_id, dx, dy
-    );
-
+    debug!("[{}] Wheel: dx={} dy={}", peer_id, dx, dy);
     match ENIGO.lock() {
         Ok(ref mut enigo) => {
             if let Err(e) = enigo.scroll(dy, Axis::Vertical) {
@@ -865,7 +1056,6 @@ fn map_key_code(code: u32) -> Key {
         VK_SHIFT => Key::Shift,
         VK_CONTROL => Key::Control,
         VK_ALT => Key::Alt,
-
         VK_BACK => Key::Backspace,
         VK_TAB => Key::Tab,
         VK_RETURN => Key::Return,
@@ -876,10 +1066,8 @@ fn map_key_code(code: u32) -> Key {
         VK_RIGHT => Key::RightArrow,
         VK_DOWN => Key::DownArrow,
         VK_DELETE => Key::Delete,
-
         c if (ASCII_PRINTABLE_MIN..=ASCII_PRINTABLE_MAX).contains(&c) =>
             Key::Unicode(char::from_u32(c).unwrap_or('?')),
-
         _ => Key::Unicode(char::from_u32(code).unwrap_or('\0')),
     }
 }
