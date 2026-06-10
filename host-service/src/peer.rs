@@ -235,12 +235,12 @@ pub struct RtcPeer {
     connection_ready: Arc<tokio::sync::Notify>,
     /// Notified when the pre-created data channel is fully open.
     dc_ready: Arc<tokio::sync::Notify>,
-    /// Notified when the viewer signals it is ready (decoder initialized).
-    viewer_ready: Arc<tokio::sync::Notify>,
     /// Set to false by the event handler when peer disconnects.
     running: Arc<AtomicBool>,
     /// Current target FPS (updated dynamically via QualityUpdate).
     fps: Arc<AtomicU32>,
+    /// Current target bitrate in kbps (updated dynamically via QualityUpdate).
+    bitrate_kbps: Arc<AtomicU32>,
     /// Guard against calling pc.close() more than once (prevents double-close panic/crash).
     pc_closed: Arc<AtomicBool>,
     /// Set to true to force the next encoded frame to be an IDR keyframe.
@@ -258,7 +258,6 @@ impl RtcPeer {
         let (ice_tx, ice_rx) = tokio::sync::mpsc::unbounded_channel();
         let connection_ready = Arc::new(tokio::sync::Notify::new());
         let dc_ready = Arc::new(tokio::sync::Notify::new());
-        let viewer_ready = Arc::new(tokio::sync::Notify::new());
         let running = Arc::new(AtomicBool::new(true));
 
         let handler = Arc::new(SignalingEventHandler::new(
@@ -336,9 +335,9 @@ impl RtcPeer {
             ice_rx: Some(ice_rx),
             connection_ready,
             dc_ready,
-            viewer_ready,
             running,
             fps: Arc::new(AtomicU32::new(frame::DEFAULT_FPS)),
+            bitrate_kbps: Arc::new(AtomicU32::new(frame::DEFAULT_BITRATE_KBPS)),
             pc_closed: Arc::new(AtomicBool::new(false)),
             force_keyframe: Arc::new(AtomicBool::new(true)), // Force IDR on first frame
         })
@@ -362,19 +361,6 @@ impl RtcPeer {
     /// or to periodically refresh the stream so new viewers can decode.
     pub fn request_keyframe(&self) {
         self.force_keyframe.store(true, Ordering::Relaxed);
-    }
-
-    /// Signal that the viewer has finished initializing its decoder
-    /// and is ready to receive video frames.
-    pub fn notify_viewer_ready(&self) {
-        self.viewer_ready.notify_waiters();
-    }
-
-    /// Get a reference to the viewer-ready signal.
-    /// The input reader uses this to notify streaming when the
-    /// viewer sends TAG_VIEWER_READY.
-    pub fn viewer_ready_notify(&self) -> Arc<tokio::sync::Notify> {
-        self.viewer_ready.clone()
     }
 
     /// Extract capturer parameters from a remote SDP (Offer or Answer)
@@ -401,13 +387,14 @@ impl RtcPeer {
         }
     }
 
-    /// Update FPS dynamically during an active session.
-    pub fn update_quality(&self, quality: u32, max_dimension: u32, fps: u32) {
+    /// Update FPS and bitrate dynamically during an active session.
+    pub fn update_quality(&self, quality: u32, max_dimension: u32, fps: u32, bitrate_kbps: u32) {
         if self.capturer.is_some() {
             self.fps.store(fps.max(1), Ordering::Relaxed);
+            self.bitrate_kbps.store(bitrate_kbps.max(500), Ordering::Relaxed);
             info!(
-                "[{}] FPS updated to {} (quality={} dim={} ignored)",
-                self.peer_id, fps, quality, max_dimension
+                "[{}] FPS={} bitrate={}kbps (quality={} dim={} ignored)",
+                self.peer_id, fps, bitrate_kbps, quality, max_dimension
             );
         } else {
             warn!("[{}] No capturer; quality update ignored", self.peer_id);
@@ -534,20 +521,6 @@ impl RtcPeer {
             }
         }
 
-        // Wait for the viewer to signal that its decoder is ready.
-        // This prevents sending SPS/PPS/IDR frames before the client
-        // has initialized its decoder, which would cause the keyframe
-        // to be lost and the stream to start with decode errors.
-        info!("[{}] Waiting for viewer to signal ready...", self.peer_id);
-        tokio::select! {
-            _ = self.viewer_ready.notified() => {
-                info!("[{}] Viewer ready, starting stream", self.peer_id);
-            }
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                warn!("[{}] Timed out waiting for viewer ready, starting anyway", self.peer_id);
-            }
-        }
-
         let dynamic_fps = self.fps.clone();
         let (w, h) = capturer.resolution();
         info!(
@@ -560,8 +533,9 @@ impl RtcPeer {
         let pc = self.peer_connection.clone();
         let pc_closed = self.pc_closed.clone();
         let force_keyframe = self.force_keyframe.clone();
+        let bitrate_kbps = self.bitrate_kbps.clone();
         tokio::spawn(async move {
-            run_video_stream_loop(capturer, video_track, video_ssrc, dynamic_fps, running, pc, pc_closed, force_keyframe).await;
+            run_video_stream_loop(capturer, video_track, video_ssrc, dynamic_fps, bitrate_kbps, running, pc, pc_closed, force_keyframe).await;
             info!("[{}] Video streaming loop ended", peer_id);
         });
 
@@ -623,6 +597,7 @@ async fn run_video_stream_loop(
     video_track: Arc<TrackLocalStaticSample>,
     ssrc: u32,
     fps: Arc<AtomicU32>,
+    bitrate_kbps: Arc<AtomicU32>,
     running: Arc<AtomicBool>,
     pc: Arc<dyn PeerConnection>,
     pc_closed: Arc<AtomicBool>,
@@ -630,10 +605,11 @@ async fn run_video_stream_loop(
 ) {
     let (w, h) = capturer.resolution();
 
-    // Create encoder at the initial FPS; it will be recreated if FPS changes
-    // significantly (rare — QualityUpdate typically only changes FPS).
+    // Create encoder at the initial FPS and bitrate; it will be recreated if either changes
+    // significantly.
     let initial_fps = fps.load(Ordering::Relaxed).max(1);
-    let mut encoder = match VideoEncoder::new(w, h, initial_fps) {
+    let initial_bitrate = bitrate_kbps.load(Ordering::Relaxed).max(500);
+    let mut encoder = match VideoEncoder::new(w, h, initial_fps, initial_bitrate) {
         Ok(enc) => enc,
         Err(e) => {
             error!("Failed to create H.264 encoder: {e}");
@@ -641,6 +617,7 @@ async fn run_video_stream_loop(
         }
     };
     let mut current_encoder_fps = initial_fps;
+    let mut current_encoder_bitrate = initial_bitrate;
 
     // Use interval-based pacing (pattern from webrtc-rs play-from-disk-h26x).
     // This avoids skew accumulation compared to plain sleep.
@@ -659,19 +636,22 @@ async fn run_video_stream_loop(
         }
 
         let current_fps = fps.load(Ordering::Relaxed).max(1);
+        let current_bitrate = bitrate_kbps.load(Ordering::Relaxed).max(500);
 
-        // Recreate encoder and ticker if FPS changed by more than 25%
+        // Recreate encoder and ticker if FPS changed by more than 25% or bitrate changed
         let fps_diff = (current_fps as i64 - current_encoder_fps as i64).unsigned_abs();
-        if fps_diff > current_encoder_fps as u64 / 4 {
+        let bitrate_diff = (current_bitrate as i64 - current_encoder_bitrate as i64).unsigned_abs();
+        if fps_diff > current_encoder_fps as u64 / 4 || bitrate_diff > current_encoder_bitrate as u64 / 4 {
             info!(
-                "FPS changed from {} to {}, recreating encoder",
-                current_encoder_fps, current_fps,
+                "Encoder params changed: fps {}→{}, bitrate {}→{}kbps, recreating",
+                current_encoder_fps, current_fps, current_encoder_bitrate, current_bitrate,
             );
             encoder.shutdown();
-            match VideoEncoder::new(w, h, current_fps) {
+            match VideoEncoder::new(w, h, current_fps, current_bitrate) {
                 Ok(enc) => {
                     encoder = enc;
                     current_encoder_fps = current_fps;
+                    current_encoder_bitrate = current_bitrate;
                     frame_duration = Duration::from_secs_f64(1.0 / current_fps as f64);
                     ticker =
                         tokio::time::interval(frame_duration);
@@ -834,18 +814,13 @@ fn build_configuration(stun_servers: &[String]) -> RTCConfiguration {
 
 /// Spawn a task that polls the `"input"` data channel and dispatches
 /// received mouse / keyboard events to the OS via `enigo`.
-/// When the viewer sends `TAG_VIEWER_READY`, notifies the peer so
-/// that streaming can begin.
-pub fn spawn_input_reader(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>, peer_id: String, viewer_ready: Arc<tokio::sync::Notify>) {
+pub fn spawn_input_reader(dc: Arc<dyn DataChannel>, running: Arc<AtomicBool>, peer_id: String) {
     tokio::spawn(async move {
         info!("[{}] Input reader started", peer_id);
         while running.load(Ordering::Relaxed) {
             match dc.poll().await {
                 Some(DataChannelEvent::OnMessage(msg)) => {
                     let tag = dispatch_input(&msg.data, &peer_id);
-                    if tag == Some(frame::TAG_VIEWER_READY) {
-                        viewer_ready.notify_waiters();
-                    }
                 }
                 Some(DataChannelEvent::OnClose) | Some(DataChannelEvent::OnError) => {
                     info!("[{}] Input channel closed", peer_id);
@@ -875,10 +850,6 @@ fn dispatch_input(data: &[u8], peer_id: &str) -> Option<u8> {
         frame::TAG_MOUSE => dispatch_mouse(data, peer_id),
         frame::TAG_KEY => dispatch_key(data, peer_id),
         frame::TAG_WHEEL => dispatch_wheel(data, peer_id),
-        frame::TAG_VIEWER_READY => {
-            info!("[{}] Received VIEWER_READY signal", peer_id);
-            return Some(frame::TAG_VIEWER_READY);
-        }
         _ => warn!("[{}] Unknown input event type: 0x{:02X}", peer_id, data[0]),
     }
     None

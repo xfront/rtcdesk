@@ -24,7 +24,7 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    pub fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self> {
         // YUV 4:2:0 requires even dimensions
         let enc_w = if width % 2 != 0 {
             (width + 1) as usize
@@ -39,15 +39,15 @@ impl VideoEncoder {
 
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
-            .bitrate(BitRate::from_bps(2_000_000))
+            .bitrate(BitRate::from_bps(bitrate_kbps * 1000))
             .max_frame_rate(FrameRate::from_hz(fps as f32));
 
         let encoder =
             Encoder::with_api_config(openh264::OpenH264API::from_source(), config)?;
 
         info!(
-            "VideoEncoder: OpenH264 {}x{} @ {} fps (source: {}x{})",
-            enc_w, enc_h, fps, width, height,
+            "VideoEncoder: OpenH264 {}x{} @ {} fps {}kbps (source: {}x{})",
+            enc_w, enc_h, fps, bitrate_kbps, width, height,
         );
 
         Ok(Self {

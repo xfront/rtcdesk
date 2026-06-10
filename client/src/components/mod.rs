@@ -8,3 +8,4 @@ pub mod resize;
 pub mod settings;
 pub mod sidebar;
 pub mod titlebar;
+pub mod icon;

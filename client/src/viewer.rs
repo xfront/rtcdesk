@@ -8,35 +8,30 @@
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use log::{info, warn, error};
+use log::{error, info, warn};
+use shared::signal::{PeerRole, SignalMessage};
+use shared::{frame, signal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use dioxus::document::document;
 use tokio::sync::{Mutex, Notify};
-use shared::{frame, signal};
-use shared::signal::{PeerRole, SignalMessage};
 
 use rtc::interceptor::Registry;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{
-    MIME_TYPE_H264, MediaEngine,
-};
-use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind,
-};
+use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_H264};
+use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use rtc::rtp_transceiver::RTCRtpTransceiverDirection;
 use rtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCConfigurationBuilder, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
-    RTCPeerConnectionState, RTCSessionDescription,
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
+    RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
+    RTCSessionDescription,
 };
-use webrtc::runtime::{Runtime, default_runtime};
-use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use webrtc::runtime::{default_runtime, Runtime};
 
-use crate::decoder::{RtpDepacketizer, FrameDecoder};
+use crate::decoder::{FrameDecoder, RtpDepacketizer};
 
 // ─── Viewer callback ─────────────────────────────────────────────────────
 
@@ -45,7 +40,7 @@ pub trait ViewerCallback: Send + Sync {
     fn on_disconnected(&self);
     fn on_connection_state(&self, state: String);
     fn on_error(&self, message: String);
-    fn on_video_frame(&self, width: u32, height: u32);
+    fn on_video_frame(&self, bgra: &[u8], width: u32, height: u32);
     fn on_clipboard_text(&self, text: String);
     fn on_clipboard_file_uris(&self, uris: String);
     fn on_clipboard_image(&self, rgba: Vec<u8>, width: u32, height: u32);
@@ -74,7 +69,7 @@ pub struct RtcViewer {
     ws_write: Arc<Mutex<Option<WsSplitSink>>>,
     viewer_id: String,
     host_id: String,
-    callback: Option<Arc<dyn ViewerCallback>>,
+    callback: Arc<dyn ViewerCallback>,
     connected: Arc<AtomicBool>,
     pub ws_disconnected: Arc<Notify>,
     pic_quality: u32,
@@ -105,17 +100,11 @@ pub struct RtcViewer {
     /// The decode thread sets it when it needs a keyframe; the on_track
     /// loop reads it and sends PLI.
     need_keyframe: Arc<AtomicBool>,
-    /// Shared callback for the decode thread to deliver decoded frames.
-    /// The decode thread locks this mutex and calls on_video_frame()
-    /// directly — same pattern as the original pre-init design,
-    /// ensuring zero-latency frame delivery to the UI.
-    decode_callback: Arc<std::sync::Mutex<Option<Arc<dyn ViewerCallback>>>>,
 }
 
 impl RtcViewer {
-    pub fn new(viewer_id: String, host_id: String) -> Self {
-        let runtime = default_runtime()
-            .expect("no async runtime available");
+    pub fn new(viewer_id: String, host_id: String, cb: Arc<dyn ViewerCallback>) -> Self {
+        let runtime = default_runtime().expect("no async runtime available");
 
         // Pre-initialize the decoder by spawning the decode thread now.
         // This way, when a WebRTC video track arrives (on_track),
@@ -124,14 +113,11 @@ impl RtcViewer {
         let decoder_ready = Arc::new(AtomicBool::new(false));
         let need_keyframe = Arc::new(AtomicBool::new(true)); // start needing keyframe
         let running = Arc::new(AtomicBool::new(false));
-        let decode_callback: Arc<std::sync::Mutex<Option<Arc<dyn ViewerCallback>>>> =
-            Arc::new(std::sync::Mutex::new(None));
 
         let decoder_ready_flag = decoder_ready.clone();
         let need_kf_flag = need_keyframe.clone();
-        let cb_ref = decode_callback.clone();
+        let cb_ref = cb.clone();
         let vid = viewer_id.clone();
-        let frame_slot = crate::get_frame_slot();
 
         std::thread::Builder::new()
             .name("video-decode".into())
@@ -156,19 +142,7 @@ impl RtcViewer {
                     }
                     if let Some(decoded) = result {
                         need_kf_flag.store(false, Ordering::Relaxed);
-
-                        // Write BGRA directly to FrameSlot (no intermediate channel)
-                        if let Some(ref slot) = frame_slot {
-                            let mut slot = slot.lock().unwrap();
-                            slot.update(&decoded.bgra_data, decoded.width, decoded.height);
-                        }
-
-                        // Notify UI via lightweight callback (dimensions only)
-                        if let Ok(guard) = cb_ref.lock() {
-                            if let Some(ref cb) = *guard {
-                                cb.on_video_frame(decoded.width, decoded.height);
-                            }
-                        }
+                        cb_ref.on_video_frame(&decoded.bgra_data, decoded.width, decoded.height);
                     }
                 }
 
@@ -180,7 +154,7 @@ impl RtcViewer {
             ws_write: Arc::new(Mutex::new(None)),
             viewer_id,
             host_id,
-            callback: None,
+            callback: cb,
             connected: Arc::new(AtomicBool::new(false)),
             ws_disconnected: Arc::new(Notify::new()),
             pic_quality: frame::DEFAULT_PIC_QUALITY,
@@ -196,16 +170,6 @@ impl RtcViewer {
             frame_sender: frame_tx,
             decoder_ready,
             need_keyframe,
-            decode_callback,
-        }
-    }
-
-    pub fn set_callback(&mut self, cb: Arc<dyn ViewerCallback>) {
-        // Store the callback both locally and in the shared slot
-        // used by the decode thread for direct frame delivery.
-        self.callback = Some(cb.clone());
-        if let Ok(mut guard) = self.decode_callback.lock() {
-            *guard = Some(cb);
         }
     }
 
@@ -236,7 +200,12 @@ impl RtcViewer {
     }
 
     /// Connect to the signaling server and send a ConnectRequest.
-    pub async fn connect(&mut self, server_addr: String, stun_servers: Vec<String>, password: String) -> Result<()> {
+    pub async fn connect(
+        &mut self,
+        server_addr: String,
+        stun_servers: Vec<String>,
+        password: String,
+    ) -> Result<()> {
         let (ws_write, ws_read) = Self::connect_to_signaling(&server_addr, &self.viewer_id).await?;
         *self.ws_write.lock().await = Some(ws_write);
 
@@ -247,7 +216,10 @@ impl RtcViewer {
             password,
         };
         self.send_signaling_message(&req).await?;
-        info!("[{}] ConnectRequest -> {} (quality={})", self.viewer_id, self.host_id, self.pic_quality);
+        info!(
+            "[{}] ConnectRequest -> {} (quality={})",
+            self.viewer_id, self.host_id, self.pic_quality
+        );
 
         self.connected.store(true, Ordering::SeqCst);
 
@@ -344,6 +316,7 @@ impl RtcViewer {
         quality: u32,
         max_dimension: u32,
         fps: u32,
+        bitrate_kbps: u32,
     ) -> Result<()> {
         let msg = SignalMessage::QualityUpdate {
             from: self.viewer_id.clone(),
@@ -351,6 +324,7 @@ impl RtcViewer {
             quality,
             max_dimension,
             fps,
+            bitrate_kbps,
         };
         self.send_signaling_message(&msg).await
     }
@@ -410,7 +384,10 @@ impl RtcViewer {
             ))
             .await
             .map_err(|_| anyhow::anyhow!("login send error"))?;
-        info!("[{}] Login sent as '{}', waiting for LoginResult", viewer_id, username);
+        info!(
+            "[{}] Login sent as '{}', waiting for LoginResult",
+            viewer_id, username
+        );
 
         loop {
             let Some(msg) = ws_read.next().await else {
@@ -424,10 +401,14 @@ impl RtcViewer {
                 Err(e) => anyhow::bail!("WS error before LoginResult: {}", e),
                 _ => continue,
             };
-            let sm: SignalMessage = serde_json::from_str(&text)
-                .context("failed to parse LoginResult")?;
+            let sm: SignalMessage =
+                serde_json::from_str(&text).context("failed to parse LoginResult")?;
             match sm {
-                SignalMessage::LoginResult { success, token, reason } => {
+                SignalMessage::LoginResult {
+                    success,
+                    token,
+                    reason,
+                } => {
                     if success {
                         info!("[{}] Login successful, token received", viewer_id);
                         let _ = token;
@@ -440,7 +421,10 @@ impl RtcViewer {
                     anyhow::bail!("Server error during login: {}", message);
                 }
                 _ => {
-                    info!("[{}] Ignoring unexpected message during login: {:?}", viewer_id, sm);
+                    info!(
+                        "[{}] Ignoring unexpected message during login: {:?}",
+                        viewer_id, sm
+                    );
                 }
             }
         }
@@ -490,9 +474,8 @@ async fn build_viewer_peer_connection(
             mime_type: MIME_TYPE_H264.to_owned(),
             clock_rate: 90000,
             channels: 0,
-            sdp_fmtp_line:
-                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                    .to_owned(),
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                .to_owned(),
             rtcp_feedback: vec![],
         },
         payload_type: 102,
@@ -556,7 +539,7 @@ async fn build_viewer_peer_connection(
 #[allow(clippy::too_many_arguments)]
 fn spawn_signaling_reader(
     mut ws_read: WsSplitStream,
-    callback: Option<Arc<dyn ViewerCallback>>,
+    callback: Arc<dyn ViewerCallback>,
     ws_write: Arc<Mutex<Option<WsSplitSink>>>,
     viewer_id: String,
     host_id: String,
@@ -609,7 +592,7 @@ fn spawn_signaling_reader(
 #[allow(clippy::too_many_arguments)]
 async fn handle_viewer_signal(
     msg: Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
-    callback: &Option<Arc<dyn ViewerCallback>>,
+    callback: &Arc<dyn ViewerCallback>,
     ws_write: &Arc<Mutex<Option<WsSplitSink>>>,
     viewer_id: &str,
     host_id: &str,
@@ -638,18 +621,30 @@ async fn handle_viewer_signal(
             };
             info!("[{}] Recv: {:?}", viewer_id, sm);
             process_signal_message(
-                sm, callback, ws_write, viewer_id, host_id, connected, ws_disconnected,
-                v_params, stun_servers, pc_mutex, input_dc, clipboard_dc, running, runtime,
-                frame_sender, decoder_ready, need_keyframe,
+                sm,
+                callback,
+                ws_write,
+                viewer_id,
+                host_id,
+                connected,
+                ws_disconnected,
+                v_params,
+                stun_servers,
+                pc_mutex,
+                input_dc,
+                clipboard_dc,
+                running,
+                runtime,
+                frame_sender,
+                decoder_ready,
+                need_keyframe,
             )
             .await
         }
         Ok(TM::Close(_)) | Err(_) => {
             connected.store(false, Ordering::SeqCst);
             ws_disconnected.notify_one();
-            if let Some(c) = callback {
-                c.on_disconnected();
-            }
+            callback.on_disconnected();
             true
         }
         _ => false,
@@ -659,7 +654,7 @@ async fn handle_viewer_signal(
 #[allow(clippy::too_many_arguments)]
 async fn process_signal_message(
     sm: SignalMessage,
-    callback: &Option<Arc<dyn ViewerCallback>>,
+    callback: &Arc<dyn ViewerCallback>,
     ws_write: &Arc<Mutex<Option<WsSplitSink>>>,
     viewer_id: &str,
     host_id: &str,
@@ -678,17 +673,14 @@ async fn process_signal_message(
 ) -> bool {
     match sm {
         SignalMessage::Registered { .. } => {
-            if let Some(c) = callback {
-                c.on_connection_state("registered".into());
-            }
+            callback.on_connection_state("registered".into());
         }
-
-        SignalMessage::AuthResult { accepted, reason, .. } => {
+        SignalMessage::AuthResult {
+            accepted, reason, ..
+        } => {
             if accepted {
                 info!("[{}] AuthResult: accepted", viewer_id);
-                if let Some(c) = callback {
-                    c.on_connection_state("auth_accepted".into());
-                }
+                callback.on_connection_state("auth_accepted".into());
             } else {
                 let msg = if reason.is_empty() {
                     "认证失败".to_string()
@@ -696,9 +688,7 @@ async fn process_signal_message(
                     format!("认证失败: {}", reason)
                 };
                 warn!("[{}] AuthResult: rejected – {}", viewer_id, msg);
-                if let Some(c) = callback {
-                    c.on_error(msg);
-                }
+                callback.on_error(msg);
             }
         }
 
@@ -781,9 +771,11 @@ async fn process_signal_message(
                         use futures_util::SinkExt;
                         let mut ws = ws_write.lock().await;
                         if let Some(ref mut w) = *ws {
-                            let _ = w.send(tokio_tungstenite::tungstenite::Message::Text(
-                                serde_json::to_string(&msg).unwrap().into(),
-                            )).await;
+                            let _ = w
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    serde_json::to_string(&msg).unwrap().into(),
+                                ))
+                                .await;
                         }
                     }
                     info!("[{}] Answer SDP sent via signaling", viewer_id);
@@ -792,7 +784,10 @@ async fn process_signal_message(
                     *pc_mutex.lock().await = Some(pc);
                 }
                 Err(e) => {
-                    error!("[{}] Failed to build viewer peer connection: {}", viewer_id, e);
+                    error!(
+                        "[{}] Failed to build viewer peer connection: {}",
+                        viewer_id, e
+                    );
                 }
             }
         }
@@ -821,16 +816,12 @@ async fn process_signal_message(
 
         SignalMessage::PeerLeft { id } if id == *host_id => {
             running.store(false, Ordering::SeqCst);
-            if let Some(c) = callback {
-                c.on_disconnected();
-            }
+            callback.on_disconnected();
             return true;
         }
 
         SignalMessage::Error { message } => {
-            if let Some(c) = callback {
-                c.on_error(message);
-            }
+            callback.on_error(message);
         }
 
         _ => {}
@@ -842,7 +833,7 @@ async fn process_signal_message(
 
 struct ViewerEventHandler {
     viewer_id: String,
-    callback: Option<Arc<dyn ViewerCallback>>,
+    callback: Arc<dyn ViewerCallback>,
     running: Arc<AtomicBool>,
     runtime: Arc<dyn Runtime>,
     input_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
@@ -863,7 +854,10 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
         // But we could log them.
         if let Ok(init) = event.candidate.to_json() {
             if !init.candidate.is_empty() {
-                info!("[{}] ICE candidate generated: {}", self.viewer_id, init.candidate);
+                info!(
+                    "[{}] ICE candidate generated: {}",
+                    self.viewer_id, init.candidate
+                );
                 // TODO: Forward via signaling. For now, ICE candidates are
                 // gathered during set_local_description and included in the answer SDP.
             }
@@ -875,9 +869,7 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
         match state {
             RTCPeerConnectionState::Connected => {
                 self.running.store(true, Ordering::SeqCst);
-                if let Some(c) = &self.callback {
-                    c.on_connected();
-                }
+                self.callback.on_connected();
 
                 // ── Send VIEWER_READY to host ──────────────────────
                 // In this version of webrtc-rs, on_track fires only
@@ -920,9 +912,7 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
             | RTCPeerConnectionState::Failed
             | RTCPeerConnectionState::Closed => {
                 self.running.store(false, Ordering::SeqCst);
-                if let Some(c) = &self.callback {
-                    c.on_disconnected();
-                }
+                self.callback.on_disconnected();
             }
             _ => {}
         }
@@ -939,9 +929,7 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
         if label == "input" {
             let input_ch = channel.clone();
             *self.input_dc.lock().await = Some(channel);
-            if let Some(c) = &self.callback {
-                c.on_data_channel_open("input".into());
-            }
+            self.callback.on_data_channel_open("input".into());
 
             // Drain internal events (OnBufferedAmountLow, etc.)
             // to prevent the event buffer from filling up.
@@ -949,10 +937,12 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
             self.runtime.spawn(Box::pin(async move {
                 while running.load(Ordering::Relaxed) {
                     match input_ch.poll().await {
-                        Some(DataChannelEvent::OnClose)
-                        | Some(DataChannelEvent::OnError) => break,
+                        Some(DataChannelEvent::OnClose) | Some(DataChannelEvent::OnError) => break,
                         None => {
-                            tokio::time::sleep(std::time::Duration::from_millis(frame::CLIPBOARD_POLL_MS)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                frame::CLIPBOARD_POLL_MS,
+                            ))
+                            .await;
                         }
                         _ => {} // drain everything else
                     }
@@ -963,9 +953,7 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
             let peer_id = self.viewer_id.clone();
             let clip_dc = channel.clone();
             *self.clipboard_dc.lock().await = Some(channel);
-            if let Some(c) = &self.callback {
-                c.on_data_channel_open("clipboard".into());
-            }
+            self.callback.on_data_channel_open("clipboard".into());
 
             // Spawn clipboard reader
             let running = self.running.clone();
@@ -983,7 +971,10 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
                             break;
                         }
                         None => {
-                            tokio::time::sleep(std::time::Duration::from_millis(frame::CLIPBOARD_POLL_MS)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                frame::CLIPBOARD_POLL_MS,
+                            ))
+                            .await;
                         }
                         _ => {}
                     }
@@ -996,7 +987,10 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
         let ssrcs = track.ssrcs().await;
         let media_ssrc = ssrcs.first().copied().unwrap_or(0);
         let kind = track.kind().await;
-        info!("[{}] Track received: kind={:?} ssrc={}", self.viewer_id, kind, media_ssrc);
+        info!(
+            "[{}] Track received: kind={:?} ssrc={}",
+            self.viewer_id, kind, media_ssrc
+        );
 
         if kind != RtpCodecKind::Video {
             return;
@@ -1032,8 +1026,7 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
                         let payload = &packet.payload;
 
                         // Fast depacketization only — no GPU/CPU decode here
-                        let (frame_data, depkt_need_kf) =
-                            depacketizer.process(payload, marker);
+                        let (frame_data, depkt_need_kf) = depacketizer.process(payload, marker);
 
                         if depkt_need_kf {
                             need_keyframe.store(true, Ordering::Relaxed);
@@ -1075,50 +1068,69 @@ impl PeerConnectionEventHandler for ViewerEventHandler {
 
 // ─── Clipboard message handling ──────────────────────────────────────────
 
-fn handle_clipboard_msg(data: &[u8], callback: &Option<Arc<dyn ViewerCallback>>, peer_id: &str) {
-    if data.is_empty() { return; }
+fn handle_clipboard_msg(data: &[u8], callback: &Arc<dyn ViewerCallback>, peer_id: &str) {
+    if data.is_empty() {
+        return;
+    }
     let tag = data[0];
     match tag {
         frame::CLIP_TAG_TEXT => {
             let text = String::from_utf8_lossy(&data[1..]).to_string();
-            info!("[{}] clipboard text received ({} bytes)", peer_id, text.len());
-            if let Some(c) = callback {
-                c.on_clipboard_text(text);
-            }
+            info!(
+                "[{}] clipboard text received ({} bytes)",
+                peer_id,
+                text.len()
+            );
+            callback.on_clipboard_text(text);
         }
         frame::CLIP_TAG_IMAGE => {
-            if data.len() < 1 + frame::CLIP_IMAGE_HDR_SIZE { return; }
+            if data.len() < 1 + frame::CLIP_IMAGE_HDR_SIZE {
+                return;
+            }
             let width = u32::from_le_bytes(data[1..5].try_into().unwrap_or_default());
             let height = u32::from_le_bytes(data[5..9].try_into().unwrap_or_default());
             let rgba = &data[9..];
-            info!("[{}] clipboard image received: {}x{}", peer_id, width, height);
-            if let Some(c) = callback {
-                c.on_clipboard_image(rgba.to_vec(), width, height);
-            }
+            info!(
+                "[{}] clipboard image received: {}x{}",
+                peer_id, width, height
+            );
+            callback.on_clipboard_image(rgba.to_vec(), width, height);
         }
         frame::CLIP_TAG_FILE_LIST => {
             // Parse file URIs from the list for clipboard sync
             let data_inner = &data[1..];
-            if data_inner.len() < frame::CLIP_FILE_LIST_MIN_LEN { return; }
+            if data_inner.len() < frame::CLIP_FILE_LIST_MIN_LEN {
+                return;
+            }
             let count = u16::from_le_bytes([data_inner[0], data_inner[1]]) as usize;
             let mut offset = frame::CLIP_FILE_LIST_MIN_LEN;
             let mut uris = Vec::new();
             for _ in 0..count {
-                if offset + 2 > data_inner.len() { break; }
-                let name_len = u16::from_le_bytes([data_inner[offset], data_inner[offset + 1]]) as usize;
+                if offset + 2 > data_inner.len() {
+                    break;
+                }
+                let name_len =
+                    u16::from_le_bytes([data_inner[offset], data_inner[offset + 1]]) as usize;
                 offset += 2;
-                if offset + name_len > data_inner.len() { break; }
-                let name = String::from_utf8_lossy(&data_inner[offset..offset + name_len]).to_string();
+                if offset + name_len > data_inner.len() {
+                    break;
+                }
+                let name =
+                    String::from_utf8_lossy(&data_inner[offset..offset + name_len]).to_string();
                 offset += name_len;
-                if offset + 8 > data_inner.len() { break; }
-                let _size = u64::from_le_bytes(data_inner[offset..offset + 8].try_into().unwrap_or_default());
+                if offset + 8 > data_inner.len() {
+                    break;
+                }
+                let _size = u64::from_le_bytes(
+                    data_inner[offset..offset + 8]
+                        .try_into()
+                        .unwrap_or_default(),
+                );
                 offset += 8;
                 uris.push(name);
             }
             let uris_str = uris.join("\n");
-            if let Some(c) = callback {
-                c.on_clipboard_file_uris(uris_str);
-            }
+            callback.on_clipboard_file_uris(uris_str);
         }
         frame::CLIP_TAG_DONE => {
             // File transfer complete — handled at a higher level

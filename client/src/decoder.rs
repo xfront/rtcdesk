@@ -18,8 +18,6 @@ use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp::packetizer::Depacketizer;
-#[cfg(feature = "vaapi")]
-use ffmpeg_sys_next as ff;
 
 // ─── Decoded frame ──────────────────────────────────────────────────
 
@@ -396,12 +394,12 @@ mod vaapi {
                 // Create AVPacket with the H264 data
                 let mut pkt = ff::av_packet_alloc();
                 if pkt.is_null() {
-                    return (None, !self.has_decoded_frame);
+                    return (None, true);
                 }
                 let ret = ff::av_new_packet(pkt, h264_data.len() as i32);
                 if ret < 0 {
                     ff::av_packet_free(&mut pkt);
-                    return (None, !self.has_decoded_frame);
+                    return (None, true);
                 }
                 ptr::copy_nonoverlapping(
                     h264_data.as_ptr(),
@@ -413,11 +411,11 @@ mod vaapi {
                 let ret = ff::avcodec_send_packet(self.codec_ctx, pkt);
                 ff::av_packet_free(&mut pkt);
                 if ret < 0 && ret != -(libc::EAGAIN as i32) {
-                    if self.has_decoded_frame {
-                        warn!("[VA-API] send_packet error: {}", av_error_to_string(ret));
-                    }
+                    warn!("[VA-API] send_packet error: {} — flushing", av_error_to_string(ret));
+                    // Bitstream error — flush to clear corrupt reference chain
+                    ff::avcodec_flush_buffers(self.codec_ctx);
                     self.on_decode_failure();
-                    return (None, !self.has_decoded_frame);
+                    return (None, true); // always request keyframe after bitstream error
                 }
 
                 // Receive decoded frame
@@ -426,13 +424,14 @@ mod vaapi {
                 if ret < 0 {
                     ff::av_frame_free(&mut frame);
                     if ret == -(libc::EAGAIN as i32) || ret == ff::AVERROR_EOF {
-                        return (None, false);
+                        return (None, false); // normal: need more data
                     }
-                    if self.has_decoded_frame {
-                        warn!("[VA-API] receive_frame error: {}", av_error_to_string(ret));
-                    }
+                    warn!("[VA-API] receive_frame error: {} — flushing", av_error_to_string(ret));
+                    // Decode error (e.g. "deblocking filter parameters out of range")
+                    // means the reference chain is broken. Flush and request keyframe.
+                    ff::avcodec_flush_buffers(self.codec_ctx);
                     self.on_decode_failure();
-                    return (None, !self.has_decoded_frame);
+                    return (None, true); // always request keyframe after decode error
                 }
 
                 // Reset failure counter on success
@@ -448,8 +447,12 @@ mod vaapi {
                     if ret < 0 {
                         ff::av_frame_free(&mut frame);
                         ff::av_frame_free(&mut sw_frame);
-                        warn!("[VA-API] hwframe_transfer failed: {}", av_error_to_string(ret));
-                        return (None, false);
+                        warn!("[VA-API] hwframe_transfer failed: {} — flushing decoder", av_error_to_string(ret));
+                        // Surface sync failure means the reference chain is broken.
+                        // Flush the decoder and request a keyframe immediately.
+                        ff::avcodec_flush_buffers(self.codec_ctx);
+                        self.on_decode_failure();
+                        return (None, true); // need keyframe
                     }
                     ff::av_frame_copy_props(sw_frame, frame);
 
@@ -469,10 +472,11 @@ mod vaapi {
                             }), false);
                         }
                         None => {
-                            warn!("[VA-API] YUV→BGRA conversion failed");
+                            warn!("[VA-API] YUV→BGRA conversion failed — flushing");
+                            ff::avcodec_flush_buffers(self.codec_ctx);
                         }
                     }
-                    return (None, !self.has_decoded_frame);
+                    return (None, true);
                 }
 
                 // Frame is in CPU memory (software decode or hwaccel fallback)
@@ -490,11 +494,12 @@ mod vaapi {
                         }), false);
                     }
                     None => {
-                        warn!("[VA-API] YUV→BGRA conversion failed");
+                        warn!("[VA-API] YUV→BGRA conversion failed — flushing");
+                        ff::avcodec_flush_buffers(self.codec_ctx);
                     }
                 }
 
-                (None, !self.has_decoded_frame)
+                (None, true)
             }
         }
 
@@ -537,6 +542,9 @@ mod vaapi {
         }
 
         /// Convert a decoded AVFrame to BGRA using sws_scale.
+        ///
+        /// Handles color range conversion (limited→full) and color space
+        /// details (BT.709/BT.601) properly for correct display quality.
         unsafe fn convert_to_bgra(
             &mut self,
             frame: *mut ff::AVFrame,
@@ -544,64 +552,104 @@ mod vaapi {
             height: u32,
             pix_fmt: ff::AVPixelFormat,
         ) -> Option<Vec<u8>> {
-            self.sws_ctx = ff::sws_getCachedContext(
-                self.sws_ctx,
-                width as i32,
-                height as i32,
-                pix_fmt,
-                width as i32,
-                height as i32,
-                ff::AVPixelFormat::AV_PIX_FMT_BGRA,
-                ff::SWS_BILINEAR,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null(),
-            );
-            if self.sws_ctx.is_null() {
-                return None;
+            // SAFETY: All FFmpeg calls require unsafe. The frame pointer
+            // is valid (just received from decode). sws_ctx is managed
+            // by sws_getCachedContext which handles reallocation.
+            unsafe {
+                self.sws_ctx = ff::sws_getCachedContext(
+                    self.sws_ctx,
+                    width as i32,
+                    height as i32,
+                    pix_fmt,
+                    width as i32,
+                    height as i32,
+                    ff::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    ff::SWS_BICUBIC,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                );
+                if self.sws_ctx.is_null() {
+                    return None;
+                }
+
+                // ── Color space details for correct display quality ──────
+                // VAAPI typically outputs limited-range (16-235) YUV.
+                // Without this fix, the BGRA output looks washed out
+                // because the 16-235 range maps to dim colors instead
+                // of the full 0-255 range.
+                let src_range = if (*frame).color_range == ff::AVColorRange::AVCOL_RANGE_JPEG {
+                    1 // full range (JPEG)
+                } else {
+                    0 // limited range (BT.709/BT.601 — the default)
+                };
+                let dst_range = 1; // always output full range
+
+                // Determine color space coefficients from the frame.
+                // Map AVColorSpace → SWS_CS constants for sws_getCoefficients.
+                let sws_cs = match (*frame).colorspace {
+                    ff::AVColorSpace::AVCOL_SPC_BT709 => ff::SWS_CS_ITU709,
+                    ff::AVColorSpace::AVCOL_SPC_BT470BG
+                    | ff::AVColorSpace::AVCOL_SPC_SMPTE170M => ff::SWS_CS_ITU601,
+                    ff::AVColorSpace::AVCOL_SPC_SMPTE240M => ff::SWS_CS_SMPTE240M,
+                    _ => ff::SWS_CS_ITU709, // default: assume BT.709 for HD
+                };
+                let src_coeffs = ff::sws_getCoefficients(sws_cs);
+                let dst_coeffs = ff::sws_getCoefficients(ff::SWS_CS_ITU709);
+
+                ff::sws_setColorspaceDetails(
+                    self.sws_ctx,
+                    src_coeffs,
+                    src_range,
+                    dst_coeffs,
+                    dst_range,
+                    0,         // brightness
+                    1 << 16,   // contrast (1.0 in 16.16 fixed point)
+                    1 << 16,   // saturation (1.0)
+                );
+
+                // Allocate BGRA frame
+                let mut bgra_frame: ff::AVFrame = std::mem::zeroed();
+                bgra_frame.width = width as i32;
+                bgra_frame.height = height as i32;
+                bgra_frame.format = ff::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+                let ret = ff::av_frame_get_buffer(&mut bgra_frame, 0);
+                if ret < 0 {
+                    return None;
+                }
+
+                // sws_scale wants *const *const u8 for srcSlice
+                let src_slices: *const *const u8 =
+                    (*frame).data.as_ptr() as *const *const u8;
+                let src_strides: *const libc::c_int = (*frame).linesize.as_ptr();
+                let dst_slices: *const *mut u8 =
+                    bgra_frame.data.as_ptr() as *const *mut u8;
+                let dst_strides: *const libc::c_int = bgra_frame.linesize.as_ptr();
+
+                // Convert
+                ff::sws_scale(
+                    self.sws_ctx,
+                    src_slices,
+                    src_strides,
+                    0,
+                    height as i32,
+                    dst_slices,
+                    dst_strides,
+                );
+
+                // Copy BGRA data (handle linesize padding)
+                let linesize = bgra_frame.linesize[0] as usize;
+                let w4 = (width * 4) as usize;
+                let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+                for y in 0..height as usize {
+                    let row_ptr = bgra_frame.data[0].add(y * linesize);
+                    let row = std::slice::from_raw_parts(row_ptr, w4);
+                    bgra.extend_from_slice(row);
+                }
+
+                ff::av_frame_unref(&mut bgra_frame);
+                Some(bgra)
             }
-
-            // Allocate BGRA frame
-            let mut bgra_frame: ff::AVFrame = std::mem::zeroed();
-            bgra_frame.width = width as i32;
-            bgra_frame.height = height as i32;
-            bgra_frame.format = ff::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
-            let ret = ff::av_frame_get_buffer(&mut bgra_frame, 0);
-            if ret < 0 {
-                return None;
-            }
-
-            // sws_scale wants *const *const u8 for srcSlice
-            let src_slices: *const *const u8 =
-                (*frame).data.as_ptr() as *const *const u8;
-            let src_strides: *const libc::c_int = (*frame).linesize.as_ptr();
-            let dst_slices: *const *mut u8 =
-                bgra_frame.data.as_ptr() as *const *mut u8;
-            let dst_strides: *const libc::c_int = bgra_frame.linesize.as_ptr();
-
-            // Convert
-            ff::sws_scale(
-                self.sws_ctx,
-                src_slices,
-                src_strides,
-                0,
-                height as i32,
-                dst_slices,
-                dst_strides,
-            );
-
-            // Copy BGRA data (handle linesize padding)
-            let linesize = bgra_frame.linesize[0] as usize;
-            let w4 = (width * 4) as usize;
-            let mut bgra = Vec::with_capacity((width * height * 4) as usize);
-            for y in 0..height as usize {
-                let row_ptr = bgra_frame.data[0].add(y * linesize);
-                let row = std::slice::from_raw_parts(row_ptr, w4);
-                bgra.extend_from_slice(row);
-            }
-
-            ff::av_frame_unref(&mut bgra_frame);
-            Some(bgra)
         }
 
         /// Flush the decoder (signal data loss).

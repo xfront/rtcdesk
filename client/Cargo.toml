@@ -36,9 +36,14 @@ image.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 rfd = "0.17"
-wry = "0.50"
 ffmpeg-sys-next = { version = "7.1", default-features = false, features = ["avcodec", "swscale"], optional = true }
 libc = { version = "0.2", optional = true }
+tray-menu = "0.1"
+tray = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-menu = { version = "0.1" , features = ["gtk"] }
+glib = "0.18"
 
 [features]
 default = ["desktop", "vaapi"]
@@ -48,3 +53,5 @@ mobile = ["dioxus/mobile"]
 
 # Decode backends
 vaapi = ["ffmpeg-sys-next", "libc"]
+
+

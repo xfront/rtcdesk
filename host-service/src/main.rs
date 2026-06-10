@@ -603,14 +603,15 @@ async fn dispatch_host_message(
             quality,
             max_dimension,
             fps,
+            bitrate_kbps,
             ..
         } => {
             info!(
-                "[{}] QualityUpdate from {}: quality={} dim={} fps={}",
-                host_id, from, quality, max_dimension, fps
+                "[{}] QualityUpdate from {}: quality={} dim={} fps={} bitrate={}kbps",
+                host_id, from, quality, max_dimension, fps, bitrate_kbps
             );
             if let Some((_, peer)) = sessions.lock().await.iter().find(|(id, _)| id == &from) {
-                peer.update_quality(quality, max_dimension, fps);
+                peer.update_quality(quality, max_dimension, fps, bitrate_kbps);
             }
         }
         SignalMessage::PeerJoined { id, role } => {
@@ -681,8 +682,7 @@ async fn setup_input_and_clipboard(
     let input_dc = peer.create_data_channel("input").await?;
     let running = peer.running_flag();
     let input_peer_id = viewer_id.to_string();
-    let viewer_ready = peer.viewer_ready_notify();
-    peer::spawn_input_reader(input_dc, running.clone(), input_peer_id, viewer_ready);
+    peer::spawn_input_reader(input_dc, running.clone(), input_peer_id);
 
     let clipboard_dc = peer.create_data_channel("clipboard").await?;
     let clip_peer_id = viewer_id.to_string();

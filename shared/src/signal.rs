@@ -66,6 +66,7 @@ pub enum SignalMessage {
         quality: u32,
         max_dimension: u32,
         fps: u32,
+        bitrate_kbps: u32,
     },
     /// 输入事件（鼠标/键盘）
     Input {

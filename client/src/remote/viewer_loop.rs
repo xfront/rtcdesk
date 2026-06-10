@@ -120,8 +120,14 @@ impl ViewerCallback for GuiCallback {
         error!("[GUI] {}", message);
         let _ = self.state_tx.send(SessionState::Error(message));
     }
-    fn on_video_frame(&self, width: u32, height: u32) {
+    fn on_video_frame(&self, bgra: &[u8], width: u32, height: u32) {
         // Forward frame dimensions to the UI (pixel data is in FrameSlot)
+        let frame_slot = crate::get_frame_slot();
+        if let Some(ref slot) = frame_slot {
+            let mut slot = slot.lock().unwrap();
+            slot.update(&bgra, width, height);
+        }
+
         let _ = self.frame_tx.send((width, height));
     }
     fn on_clipboard_text(&self, text: String) {
@@ -157,8 +163,6 @@ pub struct ViewerState {
     pub clipboard_synced: Signal<bool>,
     pub page:             Signal<Page>,
     pub view_only:        Signal<bool>,
-    #[allow(dead_code)]
-    pub is_fullscreen:    Signal<bool>,
     pub window_cmd:       Signal<Vec<crate::WindowCmd>>,
     pub stats:            Signal<ConnectionStats>,
     pub file_transfer:    Signal<crate::remote::file_transfer::FileTransferState>,
@@ -200,8 +204,7 @@ pub async fn run_viewer(
             local_id.clone()
         };
 
-        let mut viewer = RtcViewer::new(viewer_id.clone(), rid.clone());
-        viewer.set_callback(cb.clone());
+        let mut viewer = RtcViewer::new(viewer_id.clone(), rid.clone(), cb.clone());
         viewer.set_pic_quality(QUALITY_PRESETS[qidx_safe].0);
         viewer.set_resolution(QUALITY_PRESETS[qidx_safe].2, QUALITY_PRESETS[qidx_safe].3);
         viewer.set_fps(QUALITY_PRESETS[qidx_safe].4);
@@ -301,7 +304,7 @@ pub async fn run_viewer(
                     viewer.set_resolution(qref.2, qref.3);
                     viewer.set_fps(qref.4);
                     let max_dim = std::cmp::max(qref.2, qref.3);
-                    if let Err(e) = viewer.send_quality_update(qref.0, max_dim, qref.4).await {
+                    if let Err(e) = viewer.send_quality_update(qref.0, max_dim, qref.4, qref.5).await {
                         error!("[Gui] send_quality_update error: {}", e);
                     }
                 }

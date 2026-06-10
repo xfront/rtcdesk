@@ -4,21 +4,16 @@
 use std::sync::LazyLock;
 
 use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use dioxus::desktop::use_window;
 use dioxus::prelude::*;
 use dioxus_bootstrap_css::prelude::*;
 use dioxus_bootstrap_css::theme::Theme;
 
-use crate::i18n::{t as tr};
 use crate::i18n::keys;
-
-const LOGO_BYTES: &[u8] = include_bytes!("../assets/favicon.webp");
-pub static LOGO_DATA_URL: LazyLock<String> = LazyLock::new(|| {
-    format!("data:image/webp;base64,{}", STANDARD.encode(LOGO_BYTES))
-});
+use crate::i18n::t as tr;
 
 // ─── Title bar ──────────────────────────────────────────────────────────────
+use crate::components::icon::LOGO_DATA_URL;
 
 #[component]
 pub fn TitleBar(title: String, theme: Signal<Theme>, locale: Signal<String>) -> Element {

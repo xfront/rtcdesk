@@ -182,6 +182,7 @@ pub const MIN_SCALE_FACTOR: f64 = 1.0;
 pub const TITLEBAR_HEIGHT: f64 = 40.0;
 pub const DEFAULT_STUN: &str = "stun:stun.l.google.com:19302";
 pub const DEFAULT_FPS: u32 = 15;
+pub const DEFAULT_BITRATE_KBPS: u32 = 4000; // 4 Mbps default for 1080p screen content
 pub const DEFAULT_CAPTURE_DIM: u32 = 1280;
 pub const SIGNAL_STARTUP_DELAY_MS: u64 = 300;
 /// Default picture quality hint sent in SDP negotiation.

@@ -13,20 +13,36 @@
 mod clipboard;
 mod components;
 mod config;
-mod theme;
+mod decoder;
+mod frame_slot;
 mod host_process;
 mod i18n;
 mod quality;
 mod remote;
-mod viewer;
-mod toast;
 mod screenshot;
+mod theme;
+mod toast;
+mod viewer;
 
+use crate::components::icon::{load_tray_icon, load_window_icon};
+use crate::frame_slot::{FrameSlot, SharedFrameSlot, FRAME_PROTOCOL_NAME};
+use dioxus::desktop::use_window;
 use dioxus::desktop::{self, tao::window::Fullscreen};
 use dioxus::prelude::*;
-use dioxus::desktop::use_window;
 use dioxus_bootstrap_css::prelude::*;
-use dioxus::desktop::trayicon::DioxusTrayIcon;
+use std::sync::{Arc, Mutex};
+use dioxus::core::spawn_isomorphic;
+use dioxus::desktop::tao::window::Window;
+
+/// Global frame slot, set once at startup, read by RemoteView.
+static FRAME_SLOT_GLOBAL: std::sync::Mutex<Option<Arc<SharedFrameSlot>>> =
+    std::sync::Mutex::new(None);
+
+/// Get the global frame slot (called from RemoteView).
+pub fn get_frame_slot() -> Option<Arc<SharedFrameSlot>> {
+    FRAME_SLOT_GLOBAL.lock().unwrap().clone()
+}
+
 use shared::local_id;
 
 use crate::components::auth::AuthCtx;
@@ -39,11 +55,11 @@ use crate::components::resize::ResizeEdges;
 use crate::components::settings::SettingsTab;
 use crate::components::sidebar::{NavTab, Sidebar};
 use crate::components::titlebar::TitleBar;
+use crate::config::ThemeConfig;
 use crate::config::{load_config, load_stun_servers, save_config};
 use crate::remote::view::RemoteView;
-use crate::config::ThemeConfig;
 use dioxus_bootstrap_css::theme::Theme;
-
+use tray::{MouseButton, MouseButtonState, TrayIconEvent};
 // ─── Page type ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,29 +103,34 @@ fn main() {
         .with_decorations(false)
         .with_resizable(true);
 
+    // Shared frame slot for the custom rtcdesk:// protocol
+    let frame_slot: Arc<SharedFrameSlot> = Arc::new(Mutex::new(FrameSlot::new()));
+    let frame_slot_protocol = frame_slot.clone();
+
     let cfg = desktop::Config::new()
         .with_window(win_builder)
-        .with_close_behaviour(WindowCloseBehaviour::WindowHides)
-        .with_tray_icon_show_window_on_click(true);
+        .with_close_behaviour(desktop::WindowCloseBehaviour::WindowHides)
+        .with_custom_protocol(FRAME_PROTOCOL_NAME, move |_webview_id, _request| {
+            let slot = frame_slot_protocol.lock().unwrap();
+            if slot.bmp_data.is_empty() {
+                desktop::wry::http::Response::builder()
+                    .status(404)
+                    .body(std::borrow::Cow::Borrowed(&[] as &[u8]))
+                    .unwrap()
+            } else {
+                desktop::wry::http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "image/bmp")
+                    .header("Cache-Control", "no-cache, no-store")
+                    .body(std::borrow::Cow::Owned(slot.bmp_data.clone()))
+                    .unwrap()
+            }
+        });
 
-    dioxus::LaunchBuilder::new()
-        .with_cfg(cfg)
-        .launch(app);
-}
+    // Store frame_slot in a global so RemoteView can access it
+    *FRAME_SLOT_GLOBAL.lock().unwrap() = Some(frame_slot);
 
-fn load_tray_icon() -> Option<DioxusTrayIcon> {
-    let bytes = include_bytes!("assets/favicon.webp");
-    let img = image::load_from_memory(bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    DioxusTrayIcon::from_rgba(rgba.into_raw(), w, h).ok()
-}
-fn load_window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
-    let bytes = include_bytes!("assets/favicon.webp");
-    let img = image::load_from_memory(bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    dioxus::desktop::tao::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+    dioxus::LaunchBuilder::new().with_cfg(cfg).launch(app);
 }
 
 // ─── Root component ───────────────────────────────────────────────────────────
@@ -119,25 +140,30 @@ fn app() -> Element {
     // Inject custom app.css (minimal — only window chrome, remote session, theme vars)
     let mut css_injected = use_signal(|| false);
     use_effect(move || {
-        if css_injected() { return; }
+        if css_injected() {
+            return;
+        }
         css_injected.set(true);
         let css = include_str!("assets/app.css");
-        let escaped = css.replace('\\', "\\\\").replace('`', "\\`").replace('$', "\\$");
+        let escaped = css
+            .replace('\\', "\\\\")
+            .replace('`', "\\`")
+            .replace('$', "\\$");
         let _ = document::eval(&format!(
             "var s = document.createElement('style'); s.textContent = `{}`; document.head.appendChild(s);",
             escaped
         ));
     });
 
-    let cfg         = load_config();
-    let page        = use_signal(|| Page::Main);
+    let cfg = load_config();
+    let page = use_signal(|| Page::Main);
     let server_addr = use_signal(move || cfg.server_addr.clone());
-    let remote_id   = use_signal(move || cfg.remote_id.clone());
-    let quality     = use_signal(move || cfg.quality);
-    let theme       = use_signal(move || cfg.theme.0);
-    let locale      = use_signal(move || cfg.locale.clone());
-    let local_id    = use_signal(move || cfg.local_id.clone());
-    let password    = use_signal(String::new);
+    let remote_id = use_signal(move || cfg.remote_id.clone());
+    let quality = use_signal(move || cfg.quality);
+    let theme = use_signal(move || cfg.theme.0);
+    let locale = use_signal(move || cfg.locale.clone());
+    let local_id = use_signal(move || cfg.local_id.clone());
+    let password = use_signal(String::new);
 
     // Persist theme to config on change
     use_effect(move || {
@@ -164,15 +190,19 @@ fn app() -> Element {
     let mut is_fullscreen = use_signal(|| false);
     let win = use_window();
     let win2 = win.clone();
-    let win_tray = win.clone(); // captured for tray menu "Show" handler
+    let tray_window = win.window.clone(); // Arc<Window> for tray event callbacks
+    // Clone win again because the first effect will move it.
+    let win_for_cmd = win.clone();
 
     use_effect(move || {
         // Explicit read to ensure the effect subscribes to window_cmd changes.
         // `.write().drain(..)` alone may not register a reactive subscription
         // in Dioxus 0.7, causing pushed commands to never be consumed.
-        if window_cmd().is_empty() { return; }
+        if window_cmd().is_empty() {
+            return;
+        }
         let cmds: Vec<WindowCmd> = window_cmd.write().drain(..).collect();
-        let tao_win: &dioxus::desktop::tao::window::Window = &*win;
+        let tao_win: &dioxus::desktop::tao::window::Window = &*win_for_cmd;
         tao_win.set_decorations(false);
         for cmd in cmds {
             match cmd {
@@ -191,7 +221,9 @@ fn app() -> Element {
                         tao_win.set_fullscreen(None);
                     }
                 }
-                WindowCmd::Minimize => { tao_win.set_minimized(true); }
+                WindowCmd::Minimize => {
+                    tao_win.set_minimized(true);
+                }
                 WindowCmd::ToggleMaximize => {
                     tao_win.set_maximized(!tao_win.is_maximized());
                 }
@@ -207,48 +239,25 @@ fn app() -> Element {
     });
 
     // ── System tray icon ──────────────────────────────────────────────────
-    let mut tray_initialized = use_signal(|| false);
-    use_effect(move || {
-        if tray_initialized() { return; }
-        tray_initialized.set(true);
-        let icon = load_tray_icon();
+    // Architecture: background OS thread detects events (crossbeam channel is
+    // thread-safe), then dispatches via tokio mpsc to the main Dioxus task
+    // which executes GTK/window operations on the main thread.
+    let mut tray_spawned = use_signal(|| false);
+    if !tray_spawned() {
+        tray_spawned.set(true);
 
-        // Build a custom menu with MenuItem instead of PredefinedMenuItem
-        // because PredefinedMenuItem::quit is unsupported on Linux.
-        use dioxus::desktop::trayicon::menu::{Menu, MenuItem};
-        let menu = Menu::new();
-        menu.append_items(&[
-            &MenuItem::with_id("show", "&Show RTCDesk", true, None),
-            &MenuItem::with_id("quit", "&Quit", true, None),
-        ]).ok();
-
-        dioxus::desktop::trayicon::init_tray_icon(menu, icon);
-    });
-
-    // Handle tray menu events (Show / Quit)
-    // NOTE: tray_icon::menu::MenuEvent is a re-export of muda::MenuEvent,
-    // and dioxus-desktop dispatches these as UserWindowEvent::MudaMenuEvent.
-    dioxus::desktop::use_muda_event_handler(move |event| {
-        match event.id.as_ref() {
-            "show" => {
-                let w: &dioxus::desktop::tao::window::Window = &*win_tray;
-                w.set_visible(true);
-                w.set_focus();
-            }
-            "quit" => {
-                std::process::exit(0);
-            }
-            _ => {}
-        }
-    });
+        init_tray_menu(tray_window);
+    }
 
     // Resize window when switching between Main and Remote views
     use_effect(move || {
         let tao_win: &dioxus::desktop::tao::window::Window = &*win2;
         // Avoid resizing when in fullscreen
-        if is_fullscreen() { return; }
+        if is_fullscreen() {
+            return;
+        }
         let (w_res, h_res) = match page() {
-            Page::Main   => (800_u32, 600_u32),
+            Page::Main => (800_u32, 600_u32),
             Page::Remote => (1280_u32, 800_u32),
         };
         let cur = tao_win.inner_size();
@@ -259,16 +268,19 @@ fn app() -> Element {
 
     // ── Auto-start host service on launch ──────────────────────────────────
     {
-        let HostCtx { state: host_state, proc: host_proc } = use_context::<HostCtx>();
-        let host_id  = local_id();
+        let HostCtx {
+            state: host_state,
+            proc: host_proc,
+        } = use_context::<HostCtx>();
+        let host_id = local_id();
         let host_pwd = cfg.host_password.clone();
-        let stun     = load_stun_servers();
+        let stun = load_stun_servers();
         use_future(move || {
             let mut state = host_state;
-            let proc_sig  = host_proc;
-            let host_id   = host_id.clone();
-            let host_pwd  = host_pwd.clone();
-            let stun      = stun.clone();
+            let proc_sig = host_proc;
+            let host_id = host_id.clone();
+            let host_pwd = host_pwd.clone();
+            let stun = stun.clone();
             async move {
                 if !crate::host_process::is_host_running() {
                     log::info!("[auto-launch] host not running, spawning…");
@@ -309,18 +321,99 @@ fn app() -> Element {
     }
 }
 
+fn init_tray_menu(tray_window: Arc<Window>) {
+    if let Some(icon) = load_tray_icon() {
+        // 1. Create tray icon on the main thread (GTK requires this)
+        let _tray = tray::TrayIconBuilder::new()
+            .with_tooltip("RTCDesk")
+            .with_icon(icon)
+            .build()
+            .expect("Failed to create tray icon");
+        let _ = Box::leak(Box::new(_tray));
+
+        // 2. Channel from background thread → main Dioxus task
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TrayAction>(10);
+        let w_arc = tray_window.clone();
+        // Main-thread task: receives actions, executes GTK/window ops
+        dioxus_core::spawn_forever(async move {
+            use tray_menu::{CheckEntry, Divider, PopupMenu, SubMenu, TextEntry};
+            while let Some(action) = rx.recv().await {
+                match action {
+                    TrayAction::LeftClick => {
+                        w_arc.set_visible(true);
+                        w_arc.set_focus();
+                    }
+                    TrayAction::RightClick(pos) => {
+                        let mut menu = PopupMenu::new();
+                        menu.add(&TextEntry::of("open", "Open"));
+                        menu.add(&CheckEntry::of("notify", "Notifications", true));
+                        menu.add(&Divider);
+                        let mut help = SubMenu::of("Help");
+                        help.add(&TextEntry::of("about", "About"));
+                        menu.add(&help);
+                        menu.add(&Divider);
+                        menu.add(&TextEntry::of("quit", "Quit"));
+                        if let Some(id) = menu.popup(pos) {
+                            if id.0 == "quit" {
+                                std::process::exit(0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            log::info!("tray task exited");
+        });
+
+        // 3. Background OS thread: polls tray events, sends to main task
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            match event {
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => {
+                    let _ = tx.send(TrayAction::LeftClick);
+                }
+                TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    button_state: MouseButtonState::Up,
+                    position,
+                    ..
+                } => {
+                    match tx.try_send(TrayAction::RightClick(position)) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::error!("Failed to send tray action: {:?}", e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }));
+    } else {
+        log::error!("Failed to load tray icon");
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TrayAction {
+    LeftClick,
+    RightClick(dioxus::desktop::tao::dpi::PhysicalPosition<f64>),
+}
+
 // ─── Main window ─────────────────────────────────────────────────────────────
 
 #[component]
 fn MainWindow(
-    page:        Signal<Page>,
+    page: Signal<Page>,
     server_addr: Signal<String>,
-    remote_id:   Signal<String>,
-    quality:     Signal<usize>,
-    theme:       Signal<Theme>,
-    locale:      Signal<String>,
-    local_id:    Signal<String>,
-    password:    Signal<String>,
+    remote_id: Signal<String>,
+    quality: Signal<usize>,
+    theme: Signal<Theme>,
+    locale: Signal<String>,
+    local_id: Signal<String>,
+    password: Signal<String>,
 ) -> Element {
     let nav_tab = use_signal(|| NavTab::Connect);
 

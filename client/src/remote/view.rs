@@ -96,7 +96,7 @@ pub fn RemoteView(
         let vs = ViewerState {
             frame_seq, frame_w, frame_h,
             state, local_clipboard, clipboard_synced, page,
-            view_only, is_fullscreen, window_cmd, stats,
+            view_only, window_cmd, stats,
             file_transfer, toast,
         };
         let (frame_tx,     frame_rx)     = mpsc::unbounded_channel();
@@ -132,7 +132,6 @@ pub fn RemoteView(
     });
 
     let q_name = QUALITY_PRESETS[quality_idx().min(QUALITY_PRESETS.len().saturating_sub(1))].1;
-    let has_frame = frame_seq() > 0;
     let cursor_style =  if view_only() { "not-allowed" } else { "default" };
     let container_overflow = use_memo(move || {
         if scale_mode() == ScaleMode::Original { "auto" } else { "hidden" }
