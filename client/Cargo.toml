@@ -12,8 +12,6 @@ path = "src/main.rs"
 [dependencies]
 rtcdesk-shared = { path = "../shared" }
 tokio.workspace = true
-tokio-tungstenite.workspace = true
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
@@ -28,6 +26,8 @@ base64.workspace = true
 keyboard-types.workspace = true
 webrtc.workspace = true
 rtc.workspace = true
+interprocess = { version = "2.4", features = ["tokio"] }
+futures = "0.3"
 openh264.workspace = true
 dioxus = { version = "0.7" }
 dioxus-html = { version = "0.7" }
@@ -40,10 +40,12 @@ ffmpeg-sys-next = { version = "7.1", default-features = false, features = ["avco
 libc = { version = "0.2", optional = true }
 tray-menu = "0.1"
 tray = "0.1"
+crossbeam-channel = "0.5"
+ice0.workspace = true
+ice0-macro.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-menu = { version = "0.1" , features = ["gtk"] }
-glib = "0.18"
 
 [features]
 default = ["desktop", "vaapi"]

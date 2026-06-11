@@ -14,8 +14,6 @@ rtcdesk-shared = { path = "../shared" }
 webrtc.workspace = true
 rtc.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
@@ -35,3 +33,11 @@ local-ip-address.workspace = true
 dirs = "6"
 toml = "1"
 openh264.workspace = true
+interprocess = { version = "2.4", features = ["tokio"] }
+futures = "0.3"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+hostname = "0.4"
+tokio-util = { version = "0.7", features = ["compat"] }
+ice0.workspace = true
+ice0-macro.workspace = true

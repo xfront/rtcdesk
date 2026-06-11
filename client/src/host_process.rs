@@ -14,35 +14,35 @@ use std::sync::{Arc, Mutex};
 /// Manages the lifetime of a `rtcdesk-service` child process.
 pub struct HostProcess {
     child: Option<Child>,
+    /// Whether this process was spawned by the client (vs. pre-existing system service).
+    /// Only kill on drop if we spawned it.
+    spawned_by_client: bool,
 }
 
 impl HostProcess {
-    /// Spawn the `rtcdesk-service` binary.
-    ///
-    /// Configuration is passed via environment variables (the same ones
-    /// that `service/main.rs` reads):
-    ///
-    /// | Env var           | Purpose                        |
-    /// |-------------------|--------------------------------|
-    /// | `RTCDESK_ID`      | Host peer ID                   |
-    /// | `RTCDESK_ADDR`    | Signaling server bind address  |
-    /// | `RTCDESK_PASSWORD`| Access password (empty = open) |
-    /// | `RTCDESK_STUN`    | Comma-separated STUN URLs      |
-    /// | `RTCDESK_FPS`     | Streaming frame rate           |
+    /// Spawn the host-service binary.
+    /// 
+    /// The host-service reads all configuration from its config file
+    /// (`~/.config/rtcdesk/rtcdesk.json`), NOT from environment variables.
+    /// This ensures it works correctly as a systemd service or Windows service.
+    /// 
+    /// # Parameters
+    /// * `node_id` - The host's unique identifier
+    /// * `fps` - Streaming frame rate
+    /// 
+    /// # Returns
+    /// HostProcess with `spawned_by_client = true`, meaning it will be killed
+    /// when the client exits.
     pub fn spawn(
-        host_id: &str,
-        password: &str,
-        stun: &[String],
+        node_id: &str,
         fps: u32,
     ) -> Result<Self, String> {
         let bin_path = find_service_binary()?;
 
+        // Host-service reads config from ~/.config/rtcdesk/rtcdesk.json
+        // No environment variables needed - config file is the single source of truth
         let mut cmd = std::process::Command::new(&bin_path);
-        cmd.env("RTCDESK_ID", host_id);
-        // Use default bind address (0.0.0.0:9009) — service starts its own signaling server
-        cmd.env("RTCDESK_PASSWORD", password);
-        cmd.env("RTCDESK_STUN", stun.join(","));
-        cmd.env("RTCDESK_FPS", fps.to_string());
+        cmd.env("RTCDESK_ID", node_id);  // Only pass node_id for display/logging
 
         // Detach stdin/stdout so the child doesn't inherit our console
         cmd.stdin(std::process::Stdio::null())
@@ -58,7 +58,10 @@ impl HostProcess {
             child.id()
         );
 
-        Ok(Self { child: Some(child) })
+        Ok(Self { 
+            child: Some(child),
+            spawned_by_client: true,  // Mark as spawned by client
+        })
     }
 
     /// Check whether the child process is still running.
@@ -86,8 +89,25 @@ impl HostProcess {
         }
     }
 
+    /// Create a HostProcess wrapper for an existing (pre-spawned) process.
+    /// 
+    /// This is used when the host was already running (e.g., system service)
+    /// and we just want to track it WITHOUT killing it on client exit.
+    pub fn from_existing() -> Self {
+        Self {
+            child: None,
+            spawned_by_client: false,  // Don't kill on drop
+        }
+    }
+
     /// Stop the child process (kill + wait to reap).
+    /// Only kills if this process was spawned by the client.
     pub fn stop(&mut self) {
+        if !self.spawned_by_client {
+            log::info!("[HostProcess] Skipping stop - host was not spawned by client");
+            return;
+        }
+
         if let Some(ref mut child) = self.child {
             let pid = child.id();
             log::info!("[HostProcess] Stopping rtcdesk-service (pid={})", pid);
@@ -318,7 +338,7 @@ pub fn is_systemd_service_running() -> bool {
 /// Returns `Ok(())` on success, or `Err(String)` with diagnostic details.
 #[cfg(target_os = "linux")]
 pub fn install_systemd_service(
-    host_id: &str,
+    node_id: &str,
     password: &str,
     stun: &[String],
     fps: u32,
@@ -340,7 +360,7 @@ pub fn install_systemd_service(
          RTCDESK_PASSWORD={pw}\n\
          RTCDESK_STUN={stun}\n\
          RTCDESK_FPS={fps}\n",
-        id = host_id,
+        id = node_id,
         pw = password,
         stun = stun.join(","),
         fps = fps,
@@ -432,7 +452,7 @@ pub fn uninstall_systemd_service() -> Result<(), String> {
 /// Call this after the user changes host ID, password, or STUN servers.
 #[cfg(target_os = "linux")]
 pub fn update_systemd_env(
-    host_id: &str,
+    node_id: &str,
     password: &str,
     stun: &[String],
     fps: u32,
@@ -443,7 +463,7 @@ pub fn update_systemd_env(
          RTCDESK_PASSWORD={pw}\n\
          RTCDESK_STUN={stun}\n\
          RTCDESK_FPS={fps}\n",
-        id = host_id,
+        id = node_id,
         pw = password,
         stun = stun.join(","),
         fps = fps,
@@ -527,7 +547,7 @@ pub fn is_systemd_service_running() -> bool {
 /// 5. Start the service via `sc start …`.
 #[cfg(target_os = "windows")]
 pub fn install_systemd_service(
-    host_id: &str,
+    node_id: &str,
     password: &str,
     stun: &[String],
     fps: u32,
@@ -544,7 +564,7 @@ pub fn install_systemd_service(
          RTCDESK_PASSWORD={pw}\n\
          RTCDESK_STUN={stun}\n\
          RTCDESK_FPS={fps}\n",
-        id = host_id,
+        id = node_id,
         pw = password,
         stun = stun.join(","),
         fps = fps,
@@ -624,7 +644,7 @@ pub fn uninstall_systemd_service() -> Result<(), String> {
 /// Synchronise the environment file with current settings.
 #[cfg(target_os = "windows")]
 pub fn update_systemd_env(
-    host_id: &str,
+    node_id: &str,
     password: &str,
     stun: &[String],
     fps: u32,
@@ -635,7 +655,7 @@ pub fn update_systemd_env(
          RTCDESK_PASSWORD={pw}\n\
          RTCDESK_STUN={stun}\n\
          RTCDESK_FPS={fps}\n",
-        id = host_id,
+        id = node_id,
         pw = password,
         stun = stun.join(","),
         fps = fps,

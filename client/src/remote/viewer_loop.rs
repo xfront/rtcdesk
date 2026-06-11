@@ -1,6 +1,7 @@
-//! Async viewer event loop: connects to the signaling server and
+//! Async viewer event loop: connects to host-service via IPC and
 //! bridges all WebRTC operations entirely in Rust.
 //!
+//! **Signaling**: All communication with signal server goes through host-service via IPC.
 //! Video is received via webrtc-rs video track → H264 decode → JPEG.
 //! Input/clipboard DataChannels are managed in Rust.
 //! No JavaScript bridge is used.
@@ -178,6 +179,8 @@ pub async fn run_viewer(
     local_id: String,
     qidx: usize,
     password: String,
+    rpc_client: Arc<crate::rpc_client::RpcClient>,
+    stun_servers: Vec<String>,
     mut vs: ViewerState,
     mut frame_rx:     mpsc::UnboundedReceiver<(u32, u32)>,
     mut state_rx:       mpsc::UnboundedReceiver<SessionState>,
@@ -197,20 +200,48 @@ pub async fn run_viewer(
     #[allow(unused_assignments)]
     let mut reconnect_attempts = 0u32;
 
+    // Create viewer ONCE (before the reconnect loop) so it stays alive across reconnections
+    let viewer_id = if local_id.is_empty() {
+        format!("gui-{}", rand_id())
+    } else {
+        local_id.clone()
+    };
+
+    let mut viewer = RtcViewer::new(viewer_id.clone(), rid.clone(), cb.clone());
+    viewer.set_pic_quality(QUALITY_PRESETS[qidx_safe].0);
+    viewer.set_resolution(QUALITY_PRESETS[qidx_safe].2, QUALITY_PRESETS[qidx_safe].3);
+    viewer.set_fps(QUALITY_PRESETS[qidx_safe].4);
+
     'reconnect: loop {
-        let viewer_id = if local_id.is_empty() {
-            format!("gui-{}", rand_id())
-        } else {
-            local_id.clone()
-        };
+        reconnect_attempts += 1;
+        
+        // Notify UI that we're reconnecting (skip on first attempt)
+        if reconnect_attempts > 1 {
+            let _ = state_tx_clone.send(SessionState::Reconnecting(reconnect_attempts));
+            info!("[Reconnect] Attempt {} - connecting to host '{}'", reconnect_attempts, rid);
+        }
 
-        let mut viewer = RtcViewer::new(viewer_id.clone(), rid.clone(), cb.clone());
-        viewer.set_pic_quality(QUALITY_PRESETS[qidx_safe].0);
-        viewer.set_resolution(QUALITY_PRESETS[qidx_safe].2, QUALITY_PRESETS[qidx_safe].3);
-        viewer.set_fps(QUALITY_PRESETS[qidx_safe].4);
+        // TODO: Initialize RPC signaling when needed
+        // For now, WebRTC signaling is handled via HostCtx.rpc_client
+        // if let Some(rpc_client) = use_context::<Arc<Mutex<RpcClient>>>() {
+        //     viewer.init_rpc_signaling(rpc_client);
+        //     info!("[Viewer] RPC signaling initialized");
+        // } else {
+        //     warn!("[Viewer] RPC not available, host-service may not be running");
+        // }
 
-        let stun = load_stun_servers();
-        match viewer.connect(srv.clone(), stun.clone(), password.clone()).await {
+        // Connect RPC client to host-service
+        let mut rpc_client_mut = (*rpc_client).clone();
+        if let Err(e) = rpc_client_mut.connect().await {
+            warn!("Failed to connect RPC client: {}", e);
+            let _ = state_tx_clone.send(SessionState::Error(format!("RPC连接失败: {}", e)));
+            break 'reconnect;
+        }
+        info!("RPC client connected to host-service");
+
+        // Connect via RPC-based WebRTC signaling
+        info!("Connecting to host '{}' via RPC WebRTC", rid);
+        match viewer.connect_rpc(&Arc::new(rpc_client_mut), password.clone(), stun_servers.clone()).await {
             Ok(()) => {
                 reconnect_attempts = 0;
                 info!("Connected to host '{}'", rid);
@@ -304,9 +335,11 @@ pub async fn run_viewer(
                     viewer.set_resolution(qref.2, qref.3);
                     viewer.set_fps(qref.4);
                     let max_dim = std::cmp::max(qref.2, qref.3);
-                    if let Err(e) = viewer.send_quality_update(qref.0, max_dim, qref.4, qref.5).await {
-                        error!("[Gui] send_quality_update error: {}", e);
-                    }
+                    // TODO: Implement RPC-based quality update
+                    // if let Err(e) = viewer.send_quality_update_rpc(rpc_client, qref.0, max_dim, qref.4, qref.5).await {
+                    //     error!("[Gui] send_quality_update error: {}", e);
+                    // }
+                    let _ = max_dim; // Suppress unused variable warning
                 }
                 Some(()) = dc_rx.recv() => {
                     viewer.disconnect().await;

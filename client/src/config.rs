@@ -79,6 +79,94 @@ pub struct AppConfig {
     /// Display quality preset index (index into QUALITY_PRESETS).
     #[serde(default = "default_quality_idx")]
     pub quality: usize,
+
+    // ── Settings dialog fields ──────────────────────────────────────────────
+    /// Enable hardware codec.
+    #[serde(default = "default_true")]
+    pub hw_codec: bool,
+    /// Permission: allow remote keyboard input.
+    #[serde(default = "default_some_true")]
+    pub perm_keyboard: Option<bool>,
+    /// Permission: allow remote clipboard access.
+    #[serde(default = "default_some_true")]
+    pub perm_clipboard: Option<bool>,
+    /// Permission: allow remote file transfer.
+    #[serde(default = "default_some_true")]
+    pub perm_file: Option<bool>,
+    /// Permission: allow remote audio.
+    #[serde(default)]
+    pub perm_audio: Option<bool>,
+    /// Password access mode: "password_otp" | "password_permanent" | "password_both".
+    /// "password_otp"       = one-time password only
+    /// "password_permanent" = permanent password only
+    /// "password_both"      = accept either
+    #[serde(default = "default_access_mode")]
+    pub access_mode: String,
+    /// OTP length: 6 | 8 | 10.
+    #[serde(default = "default_otp_len")]
+    pub otp_len: u8,
+    /// OTP is digits-only (vs alphanumeric).
+    #[serde(default)]
+    pub otp_digits_only: bool,
+    /// Use permanent password instead of OTP (legacy field, kept for compat).
+    #[serde(default)]
+    pub use_permanent_password: Option<bool>,
+    /// Socks5/HTTP proxy address.
+    #[serde(default)]
+    pub proxy_host: String,
+    /// Default view style: "original" | "adaptive".
+    #[serde(default = "default_view_style")]
+    pub view_style: String,
+    /// Default scroll style: "auto" | "bar".
+    #[serde(default = "default_scroll_style")]
+    pub scroll_style: String,
+    /// Codec preference: "auto" | "h264" | "h265" | "vp9".
+    #[serde(default = "default_codec_pref")]
+    pub codec_pref: String,
+    /// Sync clipboard with remote.
+    #[serde(default = "default_some_true")]
+    pub sync_clipboard: Option<bool>,
+    /// Show remote cursor.
+    #[serde(default = "default_some_true")]
+    pub show_remote_cursor: Option<bool>,
+
+    // ── General – advanced ──────────────────────────────────────────────────
+    /// Auto-start host service on login.
+    #[serde(default)]
+    pub autostart: bool,
+    /// Minimize to system tray instead of closing.
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
+
+    // ── Security – advanced ─────────────────────────────────────────────────
+    /// Lock UI automatically when a remote session ends.
+    #[serde(default)]
+    pub lock_on_session_end: bool,
+    /// Deny LAN device discovery (hide from local network scans).
+    #[serde(default)]
+    pub deny_lan_discovery: bool,
+    /// Approve inbound connections interactively (click-to-accept).
+    #[serde(default)]
+    pub approve_mode_interactive: bool,
+
+    // ── Network – relay / bandwidth ─────────────────────────────────────────
+    /// Dedicated relay/TURN server address (optional, falls back to signal server relay).
+    #[serde(default)]
+    pub relay_server: String,
+    /// Outbound bandwidth cap in kbps (0 = unlimited).
+    #[serde(default)]
+    pub bandwidth_kbps: u32,
+
+    // ── Display – advanced ──────────────────────────────────────────────────
+    /// Show monitors toolbar in the remote viewer toolbar.
+    #[serde(default = "default_some_true")]
+    pub show_monitors_toolbar: Option<bool>,
+    /// Show magnifying glass overlay in remote viewer.
+    #[serde(default)]
+    pub show_magnifier: Option<bool>,
+    /// Disable UI animations (reduces CPU overhead on slow connections).
+    #[serde(default)]
+    pub disable_animations: Option<bool>,
 }
 
 fn default_locale() -> String {
@@ -87,6 +175,34 @@ fn default_locale() -> String {
 
 fn default_quality_idx() -> usize {
     shared::frame::DEFAULT_QUALITY_IDX
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_some_true() -> Option<bool> {
+    Some(true)
+}
+
+fn default_view_style() -> String {
+    "adaptive".to_string()
+}
+
+fn default_scroll_style() -> String {
+    "auto".to_string()
+}
+
+fn default_codec_pref() -> String {
+    "auto".to_string()
+}
+
+fn default_access_mode() -> String {
+    "password_otp".to_string()
+}
+
+fn default_otp_len() -> u8 {
+    6
 }
 
 // ─── Config path ────────────────────────────────────────────────────────────

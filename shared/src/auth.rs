@@ -3,7 +3,16 @@
 //! 定义信令服务器和客户端共用的 Claims 结构及有效期常量。
 
 use serde::{Deserialize, Serialize};
-use crate::signal::PeerRole;
+
+/// Role of a peer in the remote desktop session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRole {
+    /// Desktop sharing host (Rust server).
+    Host,
+    /// Remote viewer/controller (KMP client).
+    Viewer,
+}
 
 /// JWT Claims 结构
 #[derive(Debug, Clone, Serialize, Deserialize)]

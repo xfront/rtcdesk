@@ -12,7 +12,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 
 use shared::auth::{Claims, JWT_EXPIRE_SECS, JWT_REFRESH_BEFORE_SECS};
-use shared::signal::PeerRole;
+use shared::auth::PeerRole;
 
 use crate::db::Database;
 
@@ -55,8 +55,8 @@ impl AuthService {
 
     /// 用户登录。
     ///
-    /// 验证用户名和密码，成功后返回 JWT token。
-    pub fn login(&self, username: &str, password: &str) -> Result<String> {
+    /// 验证用户名和密码，成功后返回 (user_id, JWT token)。
+    pub fn login(&self, username: &str, password: &str) -> Result<(i64, String)> {
         let user = self
             .db
             .get_user_by_username(username)
@@ -75,8 +75,8 @@ impl AuthService {
         // 签发 JWT
         let token = self.issue_token(user.id, &user.username, PeerRole::Host)?;
 
-        log::info!("User '{}' logged in", username);
-        Ok(token)
+        log::info!("User '{}' logged in (id={})", username, user.id);
+        Ok((user.id, token))
     }
 
     /// 验证 JWT token，返回 Claims。

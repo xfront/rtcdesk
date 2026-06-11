@@ -1,7 +1,8 @@
-//! Login/Register component.
-//! Refactored with dioxus-bootstrap-css components.
+//! Login/Register component with auto-login on startup.
 //!
-//! Provides login and registration forms, communicating with signaling server via WebSocket.
+//! Provides login and registration forms, communicating with host-service via IPC.
+//! When saved credentials exist in config, auto-login is triggered on app startup.
+//! All signal server communication is proxied through host-service.
 
 use dioxus::prelude::*;
 use dioxus_bootstrap_css::prelude::*;
@@ -10,6 +11,8 @@ use crate::config::{load_config, save_config};
 use crate::i18n::{t as tr, tf};
 use crate::i18n::keys;
 use dioxus_bootstrap_css::theme::Theme;
+use super::SettingsCard;
+use crate::rpc_client::RpcClient;
 
 // ─── Auth status ─────────────────────────────────────────────────────────────
 
@@ -20,6 +23,10 @@ pub enum AuthStatus {
     Registering,
     LoggedIn { username: String },
     Error(String),
+    /// Signal server disconnected, attempting to reconnect
+    Disconnected,
+    /// Reconnecting to signal server (includes attempt number)
+    Reconnecting(u32),
 }
 
 #[derive(Clone)]
@@ -27,16 +34,50 @@ pub struct AuthCtx {
     pub status: Signal<AuthStatus>,
     pub username: Signal<String>,
     pub password: Signal<String>,
+    pub rpc_client: std::sync::Arc<std::sync::Mutex<RpcClient>>,
 }
 
 impl AuthCtx {
-    pub fn new() -> Self {
+    pub fn new(rpc_client: std::sync::Arc<std::sync::Mutex<RpcClient>>) -> Self {
         let cfg = load_config();
         Self {
             status: Signal::new(AuthStatus::LoggedOut),
             username: Signal::new(cfg.login_username),
             password: Signal::new(cfg.login_password),
+            rpc_client,
         }
+    }
+
+    /// Trigger auto-login if saved credentials exist.
+    /// Called once on app startup via `use_effect`.
+    pub fn try_auto_login(&self, locale: String) {
+        log::info!("[auto-login] try_auto_login called");
+        let cfg = load_config();
+        let uname = cfg.login_username;
+        let pwd = cfg.login_password;
+        log::info!("[auto-login] username='{}' pwd_len={}", uname, pwd.len());
+        if uname.is_empty() || pwd.is_empty() {
+            log::info!("[auto-login] no saved credentials, skipping");
+            return; // no saved credentials
+        }
+        let mut status = self.status;
+        let rpc_client = self.rpc_client.clone();
+        spawn(async move {
+            status.set(AuthStatus::LoggingIn);
+            let l: &'static str = Box::leak(locale.into_boxed_str());
+            let result = rpc_client.lock().unwrap().user_login(uname.clone(), pwd.clone()).await;
+            match result {
+                Ok(_) => {
+                    log::info!("Auto-login ok");
+                    status.set(AuthStatus::LoggedIn { username: uname });
+                }
+                Err(e) => {
+                    log::warn!("Auto-login failed: {}", e);
+                    // Don't show error on auto-login failure, just stay LoggedOut
+                    status.set(AuthStatus::LoggedOut);
+                }
+            }
+        });
     }
 }
 
@@ -47,17 +88,26 @@ pub fn AuthSection(
     theme: Signal<Theme>,
     locale: Signal<String>,
 ) -> Element {
-    let AuthCtx { status, mut username, mut password } = use_context::<AuthCtx>();
+    let AuthCtx { status, mut username, mut password, rpc_client } = use_context::<AuthCtx>();
     let _t = theme();
     let l: &'static str = Box::leak(locale().into_boxed_str());
 
     let current_status = status();
+    let status_text_owned: String;
     let (status_text, status_badge_color) = match &current_status {
         AuthStatus::LoggedOut => (tr(keys::AUTH_NOT_LOGGED_IN, l), Color::Secondary),
         AuthStatus::LoggingIn => (tr(keys::AUTH_LOGGING_IN, l), Color::Warning),
         AuthStatus::Registering => (tr(keys::AUTH_REGISTERING, l), Color::Warning),
         AuthStatus::LoggedIn { username } => (username.as_str(), Color::Success),
         AuthStatus::Error(msg) => (msg.as_str(), Color::Danger),
+        AuthStatus::Disconnected => {
+            status_text_owned = "信号服务器已断开".to_string();
+            (status_text_owned.as_str(), Color::Danger)
+        }
+        AuthStatus::Reconnecting(attempt) => {
+            status_text_owned = format!("重连中... (第{}次)", attempt);
+            (status_text_owned.as_str(), Color::Warning)
+        }
     };
 
     let is_busy = matches!(&current_status, AuthStatus::LoggingIn | AuthStatus::Registering);
@@ -70,7 +120,8 @@ pub fn AuthSection(
     let logout_label = tr(keys::AUTH_BTN_LOGOUT, l);
 
     rsx! {
-        super::settings::SettingsSection { title: tr(keys::AUTH_ACCOUNT, l),
+        SettingsCard {
+            title: tr(keys::AUTH_ACCOUNT, l),
             children: rsx! {
                 // Status display
                 div {
@@ -87,8 +138,12 @@ pub fn AuthSection(
                             size: Size::Sm,
                             onclick: {
                                 let mut s = status;
+                                let mut u = username;
+                                let mut p = password;
                                 move |_| {
                                     s.set(AuthStatus::LoggedOut);
+                                    u.set(String::new());
+                                    p.set(String::new());
                                     let mut cfg = load_config();
                                     cfg.login_username.clear();
                                     cfg.login_password.clear();
@@ -125,7 +180,10 @@ pub fn AuthSection(
                         color: Color::Primary,
                         class: "flex-grow-1",
                         disabled: is_busy || username().is_empty() || password().is_empty(),
-                        onclick: move |_| do_login(username(), password(), status, l.to_string()),
+                        onclick: {
+                            let rpc_client = rpc_client.clone();
+                            move |_| do_login(username(), password(), status, l.to_string(), rpc_client.clone())
+                        },
                         if matches!(status(), AuthStatus::LoggingIn) {
                             Spinner { style: SpinnerStyle::Border, size: Size::Sm, class: "me-1" }
                             "{login_busy_label}"
@@ -139,7 +197,10 @@ pub fn AuthSection(
                         outline: true,
                         class: "flex-grow-1",
                         disabled: is_busy || username().is_empty() || password().is_empty(),
-                        onclick: move |_| do_register(username(), password(), status, l.to_string()),
+                        onclick: {
+                            let rpc_client = rpc_client.clone();
+                            move |_| do_register(username(), password(), status, l.to_string(), rpc_client.clone())
+                        },
                         if matches!(status(), AuthStatus::Registering) {
                             Spinner { style: SpinnerStyle::Border, size: Size::Sm, class: "me-1" }
                             "{register_busy_label}"
@@ -171,11 +232,12 @@ fn do_login(
     password: String,
     mut status_signal: Signal<AuthStatus>,
     l: String,
+    rpc_client: std::sync::Arc<std::sync::Mutex<RpcClient>>,
 ) {
     spawn(async move {
         status_signal.set(AuthStatus::LoggingIn);
 
-        let result = ws_auth_request(&username, &password, "login", &l).await;
+        let result = rpc_client.lock().unwrap().user_login(username.clone(), password.clone()).await;
 
         match result {
             Ok(_token) => {
@@ -187,7 +249,7 @@ fn do_login(
                 status_signal.set(AuthStatus::LoggedIn { username });
             }
             Err(e) => {
-                status_signal.set(AuthStatus::Error(e));
+                status_signal.set(AuthStatus::Error(e.to_string()));
             }
         }
     });
@@ -198,11 +260,12 @@ fn do_register(
     password: String,
     mut status_signal: Signal<AuthStatus>,
     l: String,
+    rpc_client: std::sync::Arc<std::sync::Mutex<RpcClient>>,
 ) {
     spawn(async move {
         status_signal.set(AuthStatus::Registering);
 
-        let result = ws_auth_request(&username, &password, "register", &l).await;
+        let result = rpc_client.lock().unwrap().user_register(username.clone(), password.clone(), String::new()).await;
 
         match result {
             Ok(_token) => {
@@ -214,75 +277,10 @@ fn do_register(
                 status_signal.set(AuthStatus::LoggedIn { username });
             }
             Err(e) => {
-                status_signal.set(AuthStatus::Error(e));
+                status_signal.set(AuthStatus::Error(e.to_string()));
             }
         }
     });
 }
 
-async fn ws_auth_request(username: &str, password: &str, action: &str, l: &str) -> Result<String, String> {
-    use futures_util::{SinkExt, StreamExt};
-    use shared::signal::SignalMessage;
 
-    let cfg = load_config();
-    let server_addr = cfg.server_addr;
-    if server_addr.is_empty() {
-        return Err(tr(keys::AUTH_NO_SERVER, l).to_string());
-    }
-
-    let ws_url = format!("ws://{}/ws", server_addr);
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .map_err(|e| tf(keys::AUTH_CONN_FAILED, l, &[("e", &e.to_string())]))?;
-
-    let (mut ws_write, mut ws_read) = ws_stream.split();
-
-    let msg = match action {
-        "login" => SignalMessage::Login {
-            username: username.to_string(),
-            password: password.to_string(),
-        },
-        "register" => SignalMessage::UserRegister {
-            username: username.to_string(),
-            password: password.to_string(),
-        },
-        _ => return Err(tr(keys::AUTH_UNKNOWN_OP, l).to_string()),
-    };
-
-    let json = serde_json::to_string(&msg)
-        .map_err(|e| tf(keys::AUTH_SERIALIZE_FAILED, l, &[("e", &e.to_string())]))?;
-    ws_write
-        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
-        .await
-        .map_err(|e| tf(keys::AUTH_SEND_FAILED, l, &[("e", &e.to_string())]))?;
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(10), ws_read.next())
-        .await
-        .map_err(|_| tr(keys::AUTH_TIMEOUT, l).to_string())?;
-
-    let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = response else {
-        return Err(tr(keys::AUTH_DISCONNECTED, l).to_string());
-    };
-
-    let resp: SignalMessage =
-        serde_json::from_str(&text)
-            .map_err(|e| tf(keys::AUTH_PARSE_FAILED, l, &[("e", &e.to_string())]))?;
-
-    let unexpected = tr(keys::AUTH_UNEXPECTED_RESP, l).to_string();
-
-    match action {
-        "login" => match resp {
-            SignalMessage::LoginResult { success, token, reason } => {
-                if success { Ok(token) } else { Err(reason) }
-            }
-            _ => Err(unexpected.clone()),
-        },
-        "register" => match resp {
-            SignalMessage::UserRegisterResult { success, message } => {
-                if success { Ok(String::new()) } else { Err(message) }
-            }
-            _ => Err(unexpected.clone()),
-        },
-        _ => Err(unexpected),
-    }
-}

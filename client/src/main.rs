@@ -13,16 +13,19 @@
 mod clipboard;
 mod components;
 mod config;
+mod connect;
 mod decoder;
 mod frame_slot;
 mod host_process;
 mod i18n;
 mod quality;
 mod remote;
+mod rpc_client;
 mod screenshot;
 mod theme;
 mod toast;
 mod viewer;
+mod client_callback;
 
 use crate::components::icon::{load_tray_icon, load_window_icon};
 use crate::frame_slot::{FrameSlot, SharedFrameSlot, FRAME_PROTOCOL_NAME};
@@ -31,7 +34,6 @@ use dioxus::desktop::{self, tao::window::Fullscreen};
 use dioxus::prelude::*;
 use dioxus_bootstrap_css::prelude::*;
 use std::sync::{Arc, Mutex};
-use dioxus::core::spawn_isomorphic;
 use dioxus::desktop::tao::window::Window;
 
 /// Global frame slot, set once at startup, read by RemoteView.
@@ -52,14 +54,13 @@ use crate::components::host::HostCtx;
 use crate::components::host::HostState;
 use crate::components::host::HostTab;
 use crate::components::resize::ResizeEdges;
-use crate::components::settings::SettingsTab;
+use crate::components::settings_dialog::SettingsDialog;
 use crate::components::sidebar::{NavTab, Sidebar};
 use crate::components::titlebar::TitleBar;
 use crate::config::ThemeConfig;
 use crate::config::{load_config, load_stun_servers, save_config};
 use crate::remote::view::RemoteView;
 use dioxus_bootstrap_css::theme::Theme;
-use tray::{MouseButton, MouseButtonState, TrayIconEvent};
 // ─── Page type ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,9 +91,7 @@ pub enum WindowCmd {
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+    // rustls crypto provider no longer needed (ice0 uses TCP directly)
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
@@ -176,12 +175,114 @@ fn app() -> Element {
         }
     });
 
+    // Provide shared RPC client context
+    let rpc_client = use_context_provider(|| std::sync::Arc::new(std::sync::Mutex::new(crate::rpc_client::RpcClient::new())));
+
     // Provide shared Host context (persists across tab switches)
-    use_context_provider(|| HostCtx::new());
+    let host_ctx = use_context_provider(|| HostCtx::new());
 
     // Provide shared Auth context (persists across tab switches)
-    let auth_ctx = AuthCtx::new();
+    let auth_ctx = AuthCtx::new(rpc_client.clone());
     use_context_provider(|| auth_ctx.clone());
+    
+    // ── Auto-start host service on launch (MUST happen BEFORE RPC and auto-login) ──
+    let host_started_signal = use_signal(|| false);
+    {
+        let HostCtx {
+            state: host_state,
+            proc: host_proc,
+            client_callback: _,
+        } = use_context::<HostCtx>();
+        let host_id = local_id();
+        use_future(move || {
+            let mut state = host_state;
+            let proc_sig = host_proc;
+            let host_id = host_id.clone();
+            let mut started = host_started_signal;
+            async move {
+                if !crate::host_process::is_host_running() {
+                    log::info!("[auto-launch] host not running, spawning…");
+                    state.set(HostState::Starting);
+                    match crate::host_process::HostProcess::spawn(&host_id, 15) {
+                        Ok(child) => {
+                            let shared = proc_sig();
+                            let mut guard = shared.lock().unwrap();
+                            *guard = Some(child);
+                            drop(guard);
+                            state.set(HostState::Running);
+                            started.set(true);
+                            log::info!("[auto-launch] host started successfully");
+                        }
+                        Err(e) => {
+                            log::warn!("[auto-launch] failed: {}", e);
+                            state.set(HostState::Error(e));
+                        }
+                    }
+                } else {
+                    log::info!("[auto-launch] host already running, skipped");
+                    started.set(true);
+                }
+            }
+        });
+    }
+    
+    // Initialize RPC client connection to host-service
+    {
+        let rpc_client_for_init = rpc_client.clone();
+        let host_started = host_started_signal.clone();
+        use_future(move || {
+            let rpc_client = rpc_client_for_init.clone();
+            async move {
+                // Wait for host to start
+                let mut retries = 0;
+                while !host_started() && retries < 20 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    retries += 1;
+                }
+                
+                if !host_started() {
+                    log::warn!("[RPC] Host did not start in time, will retry connection later");
+                }
+                
+                // Try to connect to RPC with retries
+                for attempt in 1..=5 {
+                    let connect_result = {
+                        if let Ok(mut client) = rpc_client.lock() {
+                            client.connect().await
+                        } else {
+                            break;
+                        }
+                    };
+                    
+                    match connect_result {
+                        Ok(_) => {
+                            log::info!("[RPC] Connected to host-service");
+                            return; // Success
+                        }
+                        Err(e) => {
+                            log::warn!("[RPC] Connection attempt {} failed: {}", attempt, e);
+                            if attempt < 5 {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                }
+                log::warn!("[RPC] Failed to connect to host-service after 5 attempts");
+            }
+        });
+    }
+
+    // Auto-login on startup: delayed until RPC is ready
+    let auto_login_locale = locale();
+    use_effect(move || {
+        // Only attempt auto-login after a delay to give IPC time to connect
+        let auth_ctx_clone = auth_ctx.clone();
+        let locale_clone = auto_login_locale.clone();
+        spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            auth_ctx_clone.try_auto_login(locale_clone);
+        });
+    });
 
     // ── Window command bus ─────────────────────────────────────────────────
     // Global queue for window operations.  Only `app()` holds the DesktopService
@@ -239,14 +340,69 @@ fn app() -> Element {
     });
 
     // ── System tray icon ──────────────────────────────────────────────────
-    // Architecture: background OS thread detects events (crossbeam channel is
-    // thread-safe), then dispatches via tokio mpsc to the main Dioxus task
-    // which executes GTK/window operations on the main thread.
+    // Use the `tray` crate (NOT Dioxus built-in tray-icon) for tray events.
+    //
+    // A dedicated std::thread polls `TrayIconEvent::receiver()` and sends
+    // tray actions through a crossbeam channel. A `use_future` on the Dioxus
+    // side receives the actions and executes all UI operations on the Dioxus
+    // event loop (which IS the GTK main thread) — no glib needed.
+    let (tray_tx, tray_rx) = crossbeam_channel::unbounded::<TrayAction>();
     let mut tray_spawned = use_signal(|| false);
     if !tray_spawned() {
         tray_spawned.set(true);
+        init_tray_icon(tray_window, tray_tx);
+    }
 
-        init_tray_menu(tray_window);
+    // Handle tray actions on the Dioxus event loop (= GTK main thread)
+    {
+        let window_for_tray = win.window.clone();
+        use_future(move || {
+            let rx = tray_rx.clone();
+            let w = window_for_tray.clone();
+            async move {
+                loop {
+                    // Use spawn_blocking to wait on the crossbeam receiver
+                    // without blocking the async runtime.
+                    let rx = rx.clone();
+                    let action = tokio::task::spawn_blocking(move || {
+                        rx.recv_timeout(std::time::Duration::from_millis(200))
+                    })
+                    .await;
+
+                    let Ok(Ok(action)) = action else {
+                        continue;
+                    };
+
+                    match action {
+                        TrayAction::LeftClick => {
+                            log::info!("[tray] left click — showing window");
+                            w.set_visible(true);
+                            w.set_focus();
+                        }
+                        TrayAction::RightClick(position) => {
+                            log::info!("[tray] right click — showing popup menu");
+                            use tray_menu::{Divider, PopupMenu, TextEntry};
+                            let mut menu = PopupMenu::new();
+                            menu.add(&TextEntry::of("open", "Open"));
+                            menu.add(&Divider);
+                            menu.add(&TextEntry::of("quit", "Quit"));
+                            if let Some(id) = menu.popup(position) {
+                                match id.0.as_str() {
+                                    "open" => {
+                                        w.set_visible(true);
+                                        w.set_focus();
+                                    }
+                                    "quit" => {
+                                        std::process::exit(0);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // Resize window when switching between Main and Remote views
@@ -266,46 +422,6 @@ fn app() -> Element {
         }
     });
 
-    // ── Auto-start host service on launch ──────────────────────────────────
-    {
-        let HostCtx {
-            state: host_state,
-            proc: host_proc,
-        } = use_context::<HostCtx>();
-        let host_id = local_id();
-        let host_pwd = cfg.host_password.clone();
-        let stun = load_stun_servers();
-        use_future(move || {
-            let mut state = host_state;
-            let proc_sig = host_proc;
-            let host_id = host_id.clone();
-            let host_pwd = host_pwd.clone();
-            let stun = stun.clone();
-            async move {
-                if !crate::host_process::is_host_running() {
-                    log::info!("[auto-launch] host not running, spawning…");
-                    state.set(HostState::Starting);
-                    match crate::host_process::HostProcess::spawn(&host_id, &host_pwd, &stun, 15) {
-                        Ok(child) => {
-                            let shared = proc_sig();
-                            let mut guard = shared.lock().unwrap();
-                            *guard = Some(child);
-                            drop(guard);
-                            state.set(HostState::Running);
-                            log::info!("[auto-launch] host started successfully");
-                        }
-                        Err(e) => {
-                            log::warn!("[auto-launch] failed: {}", e);
-                            state.set(HostState::Error(e));
-                        }
-                    }
-                } else {
-                    log::info!("[auto-launch] host already running, skipped");
-                }
-            }
-        });
-    }
-
     rsx! {
         // Bootstrap head — loads Bootstrap 5.3 CSS + Bootstrap Icons
         BootstrapHead {}
@@ -321,85 +437,70 @@ fn app() -> Element {
     }
 }
 
-fn init_tray_menu(tray_window: Arc<Window>) {
-    if let Some(icon) = load_tray_icon() {
-        // 1. Create tray icon on the main thread (GTK requires this)
-        let _tray = tray::TrayIconBuilder::new()
-            .with_tooltip("RTCDesk")
-            .with_icon(icon)
-            .build()
-            .expect("Failed to create tray icon");
-        let _ = Box::leak(Box::new(_tray));
+/// Initialize the system tray icon using the `tray` crate.
+///
+/// We deliberately **avoid** Dioxus's built-in `tray-icon` module and instead
+/// use the standalone `tray` crate with its original event channel
+/// (`TrayIconEvent::receiver()`). Events are polled from a dedicated
+/// `std::thread`, which is completely independent of the Dioxus async runtime
+/// and continues working even when the window is hidden.
+///
+/// The thread sends tray actions through a crossbeam channel to a
+/// `use_future` on the Dioxus side, which runs on the Dioxus event loop
+/// (= GTK main thread). All UI operations (popup menu, window toggle) happen
+/// there — no glib needed.
+fn init_tray_icon(window: Arc<Window>, tx: crossbeam_channel::Sender<TrayAction>) {
+    let icon = match load_tray_icon() {
+        Some(i) => i,
+        None => {
+            log::error!("Failed to load tray icon");
+            return;
+        }
+    };
 
-        // 2. Channel from background thread → main Dioxus task
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<TrayAction>(10);
-        let w_arc = tray_window.clone();
-        // Main-thread task: receives actions, executes GTK/window ops
-        dioxus_core::spawn_forever(async move {
-            use tray_menu::{CheckEntry, Divider, PopupMenu, SubMenu, TextEntry};
-            while let Some(action) = rx.recv().await {
-                match action {
-                    TrayAction::LeftClick => {
-                        w_arc.set_visible(true);
-                        w_arc.set_focus();
-                    }
-                    TrayAction::RightClick(pos) => {
-                        let mut menu = PopupMenu::new();
-                        menu.add(&TextEntry::of("open", "Open"));
-                        menu.add(&CheckEntry::of("notify", "Notifications", true));
-                        menu.add(&Divider);
-                        let mut help = SubMenu::of("Help");
-                        help.add(&TextEntry::of("about", "About"));
-                        menu.add(&help);
-                        menu.add(&Divider);
-                        menu.add(&TextEntry::of("quit", "Quit"));
-                        if let Some(id) = menu.popup(pos) {
-                            if id.0 == "quit" {
-                                std::process::exit(0);
-                            }
-                        }
-                    }
-                }
+    // 1. Create tray icon on the main thread (GTK requires this)
+    let _tray = tray::TrayIconBuilder::new()
+        .with_tooltip("RTCDesk")
+        .with_icon(icon)
+        .build()
+        .expect("Failed to create tray icon");
+    // Leak to keep alive for the process lifetime
+    let _ = Box::leak(Box::new(_tray));
+
+    // 2. Background OS thread: polls tray events, sends to main task
+    tray::TrayIconEvent::set_event_handler(Some(move |event| {
+        match event {
+            tray::TrayIconEvent::Click {
+                button: tray::MouseButton::Left,
+                button_state: tray::MouseButtonState::Up,
+                ..
+            } => {
+                window.set_visible(true);
+                window.set_focus();
+                let _ = tx.send(TrayAction::LeftClick);
             }
-
-            log::info!("tray task exited");
-        });
-
-        // 3. Background OS thread: polls tray events, sends to main task
-        TrayIconEvent::set_event_handler(Some(move |event| {
-            match event {
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } => {
-                    let _ = tx.send(TrayAction::LeftClick);
-                }
-                TrayIconEvent::Click {
-                    button: MouseButton::Right,
-                    button_state: MouseButtonState::Up,
-                    position,
-                    ..
-                } => {
-                    match tx.try_send(TrayAction::RightClick(position)) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            log::error!("Failed to send tray action: {:?}", e);
-                        }
-                    }
-                }
-                _ => {}
+            tray::TrayIconEvent::Click {
+                button: tray::MouseButton::Right,
+                button_state: tray::MouseButtonState::Up,
+                position,
+                ..
+            } => {
+                log::info!("[tray] right click detected — sending to Dioxus event loop");
+                // Popup menu MUST run on the GTK main thread.
+                // Send the position to the Dioxus event loop via channel.
+                let _ = tx.send(TrayAction::RightClick(position));
             }
-        }));
-    } else {
-        log::error!("Failed to load tray icon");
-    }
+            _ => {}
+        }
+    }));
 }
 
-#[derive(Debug, Clone)]
+// ─── Tray action types ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
 enum TrayAction {
     LeftClick,
-    RightClick(dioxus::desktop::tao::dpi::PhysicalPosition<f64>),
+    RightClick(tray::dpi::PhysicalPosition<f64>),
 }
 
 // ─── Main window ─────────────────────────────────────────────────────────────
@@ -416,6 +517,8 @@ fn MainWindow(
     password: Signal<String>,
 ) -> Element {
     let nav_tab = use_signal(|| NavTab::Connect);
+    let show_settings_dialog = use_signal(|| false);
+    let show_lock_dialog = use_signal(|| false);
 
     rsx! {
         div {
@@ -424,11 +527,11 @@ fn MainWindow(
                     border-radius: 10px; overflow: hidden; user-select: none;
                     color: var(--bs-body-color);",
 
-            TitleBar { title: "RTCDesk", theme, locale }
+            TitleBar { title: "RTCDesk", theme, locale, show_settings_dialog, show_lock_dialog }
 
             div {
                 class: "d-flex flex-fill overflow-hidden",
-                Sidebar { nav_tab, _theme: theme, locale }
+                Sidebar { nav_tab, _theme: theme, locale, show_lock_dialog }
                 div {
                     class: "flex-fill d-flex flex-column overflow-y-auto",
                     style: "background: var(--bs-body-bg);",
@@ -436,12 +539,14 @@ fn MainWindow(
                         NavTab::Home     => rsx! { HomeTab    { page, server_addr, remote_id, quality, theme, locale, local_id, password } },
                         NavTab::Connect  => rsx! { ConnectTab { page, server_addr, remote_id, quality, theme, locale, password, local_id } },
                         NavTab::Host     => rsx! { HostTab    { theme, locale, local_id } },
-                        NavTab::Settings => rsx! { SettingsTab { server_addr, quality, theme, locale, local_id } },
                     }
                 }
             }
 
             ResizeEdges {}
         }
+
+        // Settings dialog overlay
+        SettingsDialog { show: show_settings_dialog, theme, locale, server_addr, quality, local_id }
     }
 }

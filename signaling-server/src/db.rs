@@ -20,9 +20,9 @@ pub struct UserRecord {
 
 /// machines 表行记录
 #[derive(Debug, Clone)]
-pub struct MachineRecord {
-    pub host_id: String,
-    pub user_id: i64,
+pub struct PeerRecord {
+    pub node_id: String,
+    pub user_id: Option<i64>,  // None means unassigned
     pub name: String,
     pub os: String,
     pub last_heartbeat: i64,
@@ -64,13 +64,13 @@ impl Database {
                 );
 
                 CREATE TABLE IF NOT EXISTS machines (
-                    host_id         TEXT PRIMARY KEY,
-                    user_id         INTEGER NOT NULL,
+                    node_id         TEXT PRIMARY KEY,
+                    user_id         INTEGER,  -- NULL means unassigned
                     name            TEXT NOT NULL DEFAULT '',
                     os              TEXT NOT NULL DEFAULT '',
                     last_heartbeat  INTEGER NOT NULL DEFAULT 0,
                     online          INTEGER NOT NULL DEFAULT 0,
-                    FOREIGN KEY (user_id) REFERENCES users(id)
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
                 );
                 ",
             )
@@ -129,46 +129,46 @@ impl Database {
     /// 插入或更新机器信息（UPSERT）。
     pub fn upsert_machine(
         &self,
-        host_id: &str,
-        user_id: i64,
+        node_id: &str,
+        user_id: Option<i64>,  // None means unassigned
         name: &str,
         os: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO machines (host_id, user_id, name, os, last_heartbeat, online)
+            "INSERT INTO machines (node_id, user_id, name, os, last_heartbeat, online)
                  VALUES (?1, ?2, ?3, ?4, ?5, 1)
-                 ON CONFLICT(host_id) DO UPDATE SET
+                 ON CONFLICT(node_id) DO UPDATE SET
                      user_id = excluded.user_id,
                      name = excluded.name,
                      os = excluded.os,
                      online = 1,
                      last_heartbeat = excluded.last_heartbeat",
-            params![host_id, user_id, name, os, chrono::Utc::now().timestamp()],
+            params![node_id, user_id, name, os, chrono::Utc::now().timestamp()],
         )
-            .with_context(|| format!("Failed to upsert machine '{}'", host_id))?;
-        log::info!("Machine '{}' upserted for user_id={}", host_id, user_id);
+            .with_context(|| format!("Failed to upsert machine '{}'", node_id))?;
+        log::info!("Peer '{}' upserted (user_id={:?})", node_id, user_id);
         Ok(())
     }
 
     /// 更新心跳时间戳并标记在线。
-    pub fn update_heartbeat(&self, host_id: &str) -> Result<()> {
+    pub fn update_heartbeat(&self, node_id: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE machines SET last_heartbeat = ?1, online = 1 WHERE host_id = ?2",
-            params![now, host_id],
+            "UPDATE machines SET last_heartbeat = ?1, online = 1 WHERE node_id = ?2",
+            params![now, node_id],
         )
-            .with_context(|| format!("Failed to update heartbeat for '{}'", host_id))?;
+            .with_context(|| format!("Failed to update heartbeat for '{}'", node_id))?;
         Ok(())
     }
 
     /// 获取指定用户的所有在线机器。
-    pub fn get_online_machines(&self, user_id: i64) -> Vec<MachineRecord> {
+    pub fn get_online_machines(&self, user_id: i64) -> Vec<PeerRecord> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT host_id, user_id, name, os, last_heartbeat, online
-             FROM machines WHERE user_id = ?1 AND online = 1",
+            "SELECT node_id, user_id, name, os, last_heartbeat, online
+             FROM machines WHERE user_id IS NOT NULL AND user_id = ?1 AND online = 1",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -177,8 +177,8 @@ impl Database {
         let rows = stmt
             .query_map(params![user_id], |row| {
                 let online: i32 = row.get(5)?;
-                Ok(MachineRecord {
-                    host_id: row.get(0)?,
+                Ok(PeerRecord {
+                    node_id: row.get(0)?,
                     user_id: row.get(1)?,
                     name: row.get(2)?,
                     os: row.get(3)?,
@@ -195,10 +195,10 @@ impl Database {
     }
 
     /// 获取所有在线机器。
-    pub fn get_all_online_machines(&self) -> Vec<MachineRecord> {
+    pub fn get_all_online_machines(&self) -> Vec<PeerRecord> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT host_id, user_id, name, os, last_heartbeat, online
+            "SELECT node_id, user_id, name, os, last_heartbeat, online
              FROM machines WHERE online = 1",
         ) {
             Ok(s) => s,
@@ -208,8 +208,8 @@ impl Database {
         let rows = stmt
             .query_map([], |row| {
                 let online: i32 = row.get(5)?;
-                Ok(MachineRecord {
-                    host_id: row.get(0)?,
+                Ok(PeerRecord {
+                    node_id: row.get(0)?,
                     user_id: row.get(1)?,
                     name: row.get(2)?,
                     os: row.get(3)?,
@@ -225,7 +225,7 @@ impl Database {
         }
     }
 
-    /// 标记超时机器为离线，返回本次变为离线的 host_id 列表。
+    /// 标记超时机器为离线，返回本次变为离线的 node_id 列表。
     pub fn mark_offline_machines(&self, timeout_secs: i64) -> Result<Vec<String>> {
         let now = chrono::Utc::now().timestamp();
         let cutoff = now - timeout_secs;
@@ -234,7 +234,7 @@ impl Database {
 
         // 先查出即将变为离线的机器
         let mut stmt = conn.prepare(
-            "SELECT host_id FROM machines WHERE online = 1 AND last_heartbeat < ?1",
+            "SELECT node_id FROM machines WHERE online = 1 AND last_heartbeat < ?1",
         )?;
 
         let offlined: Vec<String> = stmt
@@ -254,9 +254,85 @@ impl Database {
         .with_context(|| "Failed to mark offline machines")?;
 
         for mid in &offlined {
-            log::warn!("Machine '{}' marked offline (timeout)", mid);
+            log::warn!("Peer '{}' marked offline (timeout)", mid);
         }
 
         Ok(offlined)
+    }
+
+    /// Unbind a machine from a user (set user_id to NULL).
+    pub fn machine_unbind(&self, node_id: &str, user_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows_affected = conn.execute(
+            "UPDATE machines SET user_id = NULL WHERE node_id = ?1 AND user_id = ?2",
+            params![node_id, user_id],
+        )
+        .with_context(|| format!("Failed to unbind machine '{}'", node_id))?;
+        
+        let unbound = rows_affected > 0;
+        if unbound {
+            log::info!("Peer '{}' unbound from user_id={}", node_id, user_id);
+        } else {
+            log::warn!("Peer '{}' not found or not bound to user_id={}", node_id, user_id);
+        }
+        Ok(unbound)
+    }
+
+    /// Get machines bound to a user.
+    pub fn get_user_machines(&self, user_id: i64) -> Vec<PeerRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT node_id, user_id, name, os, last_heartbeat, online
+             FROM machines WHERE user_id = ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = stmt
+            .query_map(params![user_id], |row| {
+                let online: i32 = row.get(5)?;
+                Ok(PeerRecord {
+                    node_id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    name: row.get(2)?,
+                    os: row.get(3)?,
+                    last_heartbeat: row.get(4)?,
+                    online: online != 0,
+                })
+            })
+            .ok();
+
+        match rows {
+            Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Get machine record by node_id.
+    pub fn get_machine_by_node_id(&self, node_id: &str) -> Result<Option<PeerRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, user_id, name, os, last_heartbeat, online
+             FROM machines WHERE node_id = ?1",
+        )?;
+
+        let mut rows = stmt.query_map(params![node_id], |row| {
+            let online: i32 = row.get(5)?;
+            Ok(PeerRecord {
+                node_id: row.get(0)?,
+                user_id: row.get(1)?,
+                name: row.get(2)?,
+                os: row.get(3)?,
+                last_heartbeat: row.get(4)?,
+                online: online != 0,
+            })
+        })?;
+
+        if let Some(row) = rows.next() {
+            Ok(Some(row?))
+        } else {
+            Ok(None)
+        }
     }
 }

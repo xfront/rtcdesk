@@ -4,12 +4,17 @@
 use dioxus::prelude::*;
 use dioxus_bootstrap_css::prelude::*;
 
+use crate::components::auth::AuthCtx;
 use crate::config::{load_config, save_config};
-use crate::i18n::{t as tr};
 use crate::i18n::keys;
+use crate::i18n::t as tr;
 use crate::local_id::format_local_id;
-use dioxus_bootstrap_css::theme::Theme;
+use crate::rpc_client::RpcClient;
 use crate::Page;
+use dioxus_bootstrap_css::theme::Theme;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 
 // ─── Device data model ────────────────────────────────────────────────────────
 
@@ -21,6 +26,7 @@ pub struct DeviceItem {
     pub os: String,
     pub online: bool,
     pub is_local: bool,
+    pub is_bound: bool, // Whether this machine is bound to current user
 }
 
 impl DeviceItem {
@@ -49,29 +55,49 @@ pub fn HomeTab(
     local_id: Signal<String>,
     password: Signal<String>,
 ) -> Element {
+    // Get auth context from context provider
+    let auth_ctx: AuthCtx = use_context();
     let l: &'static str = Box::leak(locale().into_boxed_str());
     let my_id = local_id();
 
     let mut search_text = use_signal(String::new);
     let mut selected_id = use_signal(|| Option::<String>::None);
+    let mut show_machine_mgmt = use_signal(|| false);
+    let mut bind_node_id = use_signal(String::new);
+    let mut bind_name = use_signal(String::new);
+    let mut bind_os = use_signal(String::new);
+    let mut bind_message = use_signal(|| Option::<String>::None);
+
+    // TODO: Subscribe to ClientCallback notifications via RpcClient
+    // For now, machine status updates are handled via HostCtx.client_callback
+    // use_effect(move || {
+    //     let rpc_client = use_context::<std::sync::Arc<std::sync::Mutex<RpcClient>>>();
+    //     // Register callback handlers for peer status changes
+    // });
 
     let all_devices = use_memo(move || build_device_list(&my_id, &l));
 
     let filtered_devices = use_memo(move || {
         let query = search_text().to_lowercase();
-        if query.is_empty() { return all_devices(); }
+        if query.is_empty() {
+            return all_devices();
+        }
         all_devices()
             .into_iter()
-            .filter(|d| d.display_name().to_lowercase().contains(&query)
-                || d.id.to_lowercase().contains(&query))
+            .filter(|d| {
+                d.display_name().to_lowercase().contains(&query)
+                    || d.id.to_lowercase().contains(&query)
+            })
             .collect::<Vec<_>>()
     });
 
     let groups = use_memo(move || {
         let devs = filtered_devices();
-        vec![
-            DeviceGroup { label: tr(keys::HOME_GROUP_MY, l).to_string(), devices: devs, expanded: true },
-        ]
+        vec![DeviceGroup {
+            label: tr(keys::HOME_GROUP_MY, l).to_string(),
+            devices: devs,
+            expanded: true,
+        }]
     });
 
     rsx! {
@@ -82,6 +108,89 @@ pub fn HomeTab(
             div {
                 class: "flex-grow-1 min-w-0 d-flex flex-column overflow-y-auto",
                 style: "padding: 16px 20px; border-right: 1px solid var(--bs-border-color);",
+
+                // Peer management section
+                div { class: "mb-3 flex-shrink-0",
+                    Card {
+                        div { class: "card-body p-2",
+                            div { class: "d-flex justify-content-between align-items-center mb-2",
+                                h6 { class: "mb-0 small fw-bold", "🖥️ 我的机器" }
+                                Button {
+                                    color: Color::Primary,
+                                    size: Size::Sm,
+                                    onclick: move |_| {
+                                        show_machine_mgmt.set(!show_machine_mgmt());
+                                        // TODO: Use RPC client to fetch machine list
+                                        // let rpc_client = use_context::<std::sync::Arc<std::sync::Mutex<RpcClient>>>();
+                                        // spawn(async move {
+                                        //     rpc_client.lock().unwrap().machine_list().await;
+                                        // });
+                                    },
+                                    if show_machine_mgmt() { "收起" } else { "管理机器" }
+                                }
+                            }
+
+                            if show_machine_mgmt() {
+                                div { class: "mt-2",
+                                    // Bind machine form
+                                    div { class: "mb-2 p-2 bg-light rounded",
+                                        small { class: "fw-bold d-block mb-1", "绑定新机器" }
+                                        div { class: "d-flex flex-column gap-1",
+                                            Input {
+                                                class: "form-control form-control-sm",
+                                                r#type: "text",
+                                                placeholder: "机器ID (node_id)",
+                                                value: "{bind_node_id()}",
+                                                oninput: move |e: FormEvent| bind_node_id.set(e.value()),
+                                            }
+                                            Input {
+                                                class: "form-control form-control-sm",
+                                                r#type: "text",
+                                                placeholder: "机器名称",
+                                                value: "{bind_name()}",
+                                                oninput: move |e: FormEvent| bind_name.set(e.value()),
+                                            }
+                                            Input {
+                                                class: "form-control form-control-sm",
+                                                r#type: "text",
+                                                placeholder: "操作系统 (如 Windows, Linux)",
+                                                value: "{bind_os()}",
+                                                oninput: move |e: FormEvent| bind_os.set(e.value()),
+                                            }
+                                            Button {
+                                                color: Color::Success,
+                                                size: Size::Sm,
+                                                disabled: bind_node_id().is_empty() || bind_name().is_empty(),
+                                                onclick: move |_| {
+                                                    let node_id = bind_node_id();
+                                                    let name = bind_name();
+                                                    let os = bind_os();
+                                                    if !node_id.is_empty() && !name.is_empty() {
+                                                        bind_message.set(Some(format!("正在绑定机器: {}", name.clone())));
+                                                        // TODO: Use RPC client to bind machine
+                                                        // let rpc_client = use_context::<std::sync::Arc<std::sync::Mutex<RpcClient>>>();
+                                                        // let future = rpc_client.lock().unwrap().machine_bind(node_id.clone(), name.clone(), os.clone());
+                                                        // spawn(async move {
+                                                        //     future.await;
+                                                        // });
+                                                        // Clear form
+                                                        bind_node_id.set(String::new());
+                                                        bind_name.set(String::new());
+                                                        bind_os.set(String::new());
+                                                    }
+                                                },
+                                                "绑定机器"
+                                            }
+                                            if let Some(msg) = bind_message() {
+                                                small { class: "text-muted", "{msg}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Search row
                 div { class: "d-flex gap-2 mb-3 flex-shrink-0",
@@ -255,7 +364,11 @@ fn DeviceRow(
     let sel_id = device.id.clone();
     let con_id = device.id.clone();
     let badge_text = tr(keys::HOME_BADGE_LOCAL, l);
-    let row_bg = if selected { "rgba(var(--bs-success-rgb), 0.12)" } else { "transparent" };
+    let row_bg = if selected {
+        "rgba(var(--bs-success-rgb), 0.12)"
+    } else {
+        "transparent"
+    };
 
     rsx! {
         button {
@@ -294,7 +407,8 @@ fn DeviceDetailPanel(
     let l: &'static str = Box::leak(locale.into_boxed_str());
 
     let device = devices.iter().find(|d| d.id == selected_id).cloned();
-    let alias_text = device.as_ref()
+    let alias_text = device
+        .as_ref()
         .and_then(|d| d.alias.clone())
         .unwrap_or_else(|| tr(keys::HOME_DETAIL_SET_ALIAS, l).to_string());
 
@@ -377,19 +491,29 @@ fn build_device_list(my_id: &str, l: &str) -> Vec<DeviceItem> {
         os: std::env::consts::OS.to_string(),
         online: true,
         is_local: true,
+        is_bound: true,
     });
 
     let cfg = load_config();
     let mid = my_id.to_string();
     for entry in &cfg.connection_history {
         if entry.remote_id != mid {
+            // TODO: Get online status from RPC client or cached state
+            // For now, assume offline
+            let online = false;
+
             result.push(DeviceItem {
                 id: entry.remote_id.clone(),
                 name: format_local_id(&entry.remote_id),
-                alias: if entry.alias.is_empty() { None } else { Some(entry.alias.clone()) },
+                alias: if entry.alias.is_empty() {
+                    None
+                } else {
+                    Some(entry.alias.clone())
+                },
                 os: String::new(),
-                online: false,
+                online,
                 is_local: false,
+                is_bound: true, // Assume bound if in connection history
             });
         }
     }

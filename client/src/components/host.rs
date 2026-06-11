@@ -15,6 +15,7 @@ use crate::host_process::{HostProcess, SharedHostProcess, is_systemd_service_ins
                           is_systemd_service_running, install_systemd_service,
                           uninstall_systemd_service, update_systemd_env,
                           restart_systemd_service};
+use crate::client_callback::ClientCallbackImpl;
 
 // ─── Host service state ──────────────────────────────────────────────────────
 
@@ -26,10 +27,11 @@ pub enum HostState {
     Error(String),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct HostCtx {
     pub state: Signal<HostState>,
     pub proc: Signal<SharedHostProcess>,
+    pub client_callback: std::sync::Arc<ClientCallbackImpl>,
 }
 
 impl HostCtx {
@@ -37,6 +39,7 @@ impl HostCtx {
         Self {
             state: Signal::new(HostState::Stopped),
             proc: Signal::new(std::sync::Arc::new(std::sync::Mutex::new(None))),
+            client_callback: std::sync::Arc::new(ClientCallbackImpl::new()),
         }
     }
 }
@@ -60,7 +63,7 @@ pub fn HostTab(
 ) -> Element {
     let _t = theme();
     let l: &'static str = Box::leak(locale().into_boxed_str());
-    let HostCtx { state: mut host_state, proc: host_proc } = use_context::<HostCtx>();
+    let HostCtx { state: mut host_state, proc: host_proc, client_callback: _ } = use_context::<HostCtx>();
     let mut host_password = use_signal(move || load_config().host_password.clone());
     let my_id = local_id();
     let id_for_install  = my_id.clone();
@@ -297,12 +300,10 @@ pub fn HostTab(
                                     } else {
                                         host_state.set(HostState::Starting);
                                         let id = id_for_spawn.clone();
-                                        let pwd = host_password();
-                                        let stun = crate::config::load_stun_servers();
                                         let proc = host_proc();
                                         let mut hs = host_state.clone();
                                         spawn(async move {
-                                            match HostProcess::spawn(&id, &pwd, &stun, 15) {
+                                            match HostProcess::spawn(&id, 15) {
                                                 Ok(child) => {
                                                     let mut guard = proc.lock().unwrap();
                                                     *guard = Some(child);

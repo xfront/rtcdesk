@@ -1,25 +1,27 @@
-//! Custom title bar: TitleBar, WinBtn.
-//! Uses dioxus-bootstrap-css for theme toggle.
+//! Custom title bar with dropdown menu.
+//! Uses dioxus-bootstrap-css for theme toggle and Dropdown component.
 
-use std::sync::LazyLock;
-
-use base64::engine::general_purpose::STANDARD;
 use dioxus::desktop::use_window;
 use dioxus::prelude::*;
 use dioxus_bootstrap_css::prelude::*;
 use dioxus_bootstrap_css::theme::Theme;
 
+use crate::components::auth::{AuthCtx, AuthStatus};
+use crate::config::{load_config, save_config};
 use crate::i18n::keys;
 use crate::i18n::t as tr;
 
-// ─── Title bar ──────────────────────────────────────────────────────────────
 use crate::components::icon::LOGO_DATA_URL;
 
 #[component]
-pub fn TitleBar(title: String, theme: Signal<Theme>, locale: Signal<String>) -> Element {
+pub fn TitleBar(title: String, theme: Signal<Theme>, locale: Signal<String>, show_settings_dialog: Signal<bool>, show_lock_dialog: Signal<bool>) -> Element {
     let window = use_window();
-    let (w1, w2, w3) = (window.clone(), window.clone(), window.clone());
+    let (w1, w2, w3, w4) = (window.clone(), window.clone(), window.clone(), window.clone());
     let l: &'static str = Box::leak(locale().into_boxed_str());
+    let AuthCtx { mut status, mut username, mut password, .. } = use_context::<AuthCtx>();
+    let is_logged_in = matches!(status(), AuthStatus::LoggedIn { .. });
+    let mut show_menu = use_signal(|| false);
+    let is_locked = use_signal(|| false);
 
     rsx! {
         div {
@@ -52,6 +54,63 @@ pub fn TitleBar(title: String, theme: Signal<Theme>, locale: Signal<String>) -> 
                 ThemeToggle { theme }
 
                 div { style: "width: 1px; height: 16px; background: var(--bs-border-color); margin: 0 2px;" }
+
+                // ── Dropdown menu ────────────────────────────
+                Dropdown {
+                    toggle_class: "border-0",
+                    open: show_menu,
+                    toggle: rsx! {
+                        Button {
+                            color: Color::Secondary,
+                            outline: true,
+                            size: Size::Sm,
+                            class: "border-0",
+                            "☰"
+                        }
+                    },
+                    menu: rsx! {
+                        DropdownItem {
+                            onclick: move |_| {
+                                show_settings_dialog.set(true);
+                                show_menu.set(false);
+                            },
+                            "⚙ {tr(keys::MENU_SETTINGS, l)}"
+                        }
+                        DropdownItem {
+                            onclick: move |_| {
+                                show_lock_dialog.set(true);
+                                show_menu.set(false);
+                            },
+                            "{tr(keys::MENU_LOCK_UI, l)}"
+                        }
+                        // Separator
+                        div {
+                            class: "dropdown-divider",
+                        }
+                        if is_logged_in {
+                            DropdownItem {
+                                onclick: move |_| {
+                                    status.set(AuthStatus::LoggedOut);
+                                    username.set(String::new());
+                                    password.set(String::new());
+                                    let mut cfg = load_config();
+                                    cfg.login_username.clear();
+                                    cfg.login_password.clear();
+                                    save_config(&cfg);
+                                    show_menu.set(false);
+                                },
+                                "🔒 {tr(keys::MENU_LOGOUT, l)}"
+                            }
+                        }
+                        DropdownItem {
+                            onclick: move |_| {
+                                w4.close();
+                            },
+                            style: "color: var(--bs-danger);",
+                            "✕ {tr(keys::MENU_EXIT, l)}"
+                        }
+                    },
+                }
 
                 WinBtn {
                     icon: "⎯",

@@ -46,8 +46,9 @@ use webrtc::peer_connection::{
     RTCConfigurationBuilder, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
     RTCPeerConnectionState, RTCSdpType, RTCSessionDescription,
 };
-use shared::{frame, signal};
-use shared::signal::SignalMessage;
+use shared::frame;
+use shared::ice0_service::IceCandidateInfo;
+use shared::sdp_utils;
 use crate::capture::ScreenCapturer;
 use crate::encoder::VideoEncoder;
 
@@ -112,7 +113,7 @@ pub fn discover_udp_addrs() -> Vec<String> {
 #[derive(Clone)]
 struct SignalingEventHandler {
     /// Sender for forwarding ICE candidates as signaling messages.
-    ice_tx: tokio::sync::mpsc::UnboundedSender<SignalMessage>,
+    ice_tx: tokio::sync::mpsc::UnboundedSender<IceCandidateInfo>,
     /// Our peer ID.
     peer_id: String,
     /// Notified when ICE connection is established.
@@ -123,7 +124,7 @@ struct SignalingEventHandler {
 
 impl SignalingEventHandler {
     fn new(
-        ice_tx: tokio::sync::mpsc::UnboundedSender<SignalMessage>,
+        ice_tx: tokio::sync::mpsc::UnboundedSender<IceCandidateInfo>,
         peer_id: String,
         connection_ready: Arc<tokio::sync::Notify>,
         running: Arc<AtomicBool>,
@@ -146,7 +147,7 @@ impl PeerConnectionEventHandler for SignalingEventHandler {
                     info!("[{}] ICE candidate gathering complete", self.peer_id);
                     return;
                 }
-                let msg = SignalMessage::IceCandidate {
+                let msg = IceCandidateInfo {
                     from: self.peer_id.clone(),
                     to: String::new(),
                     candidate: init.candidate,
@@ -228,9 +229,9 @@ pub struct RtcPeer {
     /// SSRC assigned to the video track (set at construction time).
     video_ssrc: u32,
     /// Channel for sending ICE candidate signaling messages.
-    ice_tx: tokio::sync::mpsc::UnboundedSender<SignalMessage>,
+    ice_tx: tokio::sync::mpsc::UnboundedSender<IceCandidateInfo>,
     /// Receiver end — call `take_ice_receiver()` to drain and forward candidates.
-    ice_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SignalMessage>>,
+    ice_rx: Option<tokio::sync::mpsc::UnboundedReceiver<IceCandidateInfo>>,
     /// Notified when ICE connection is established.
     connection_ready: Arc<tokio::sync::Notify>,
     /// Notified when the pre-created data channel is fully open.
@@ -366,7 +367,7 @@ impl RtcPeer {
     /// Extract capturer parameters from a remote SDP (Offer or Answer)
     /// and apply them to the attached `ScreenCapturer`.
     pub fn apply_capturer_params_from_sdp(&self, sdp: &str) {
-        let params = signal::extract_capturer_params_from_sdp(sdp);
+        let params = sdp_utils::extract_capturer_params_from_sdp(sdp);
         if let Some(q) = params.pic_quality {
             info!(
                 "[{}] Remote pic_quality={} (info only)",
@@ -404,7 +405,7 @@ impl RtcPeer {
     /// Read the fps hint from a remote SDP. Used to override the default fps
     /// when the remote side requests a specific frame rate.
     pub fn fps_from_remote_sdp(sdp: &str, default_fps: u32) -> u32 {
-        signal::extract_capturer_params_from_sdp(sdp)
+        sdp_utils::extract_capturer_params_from_sdp(sdp)
             .fps
             .unwrap_or(default_fps)
     }
@@ -414,7 +415,7 @@ impl RtcPeer {
     /// Returns `None` if already taken.
     pub fn take_ice_receiver(
         &mut self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<SignalMessage>> {
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<IceCandidateInfo>> {
         self.ice_rx.take()
     }
 

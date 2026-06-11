@@ -12,11 +12,13 @@ use std::sync::Arc;
 use dioxus::desktop::use_window;
 use dioxus::prelude::*;
 use dioxus_bootstrap_css::prelude::*;
+use log::warn;
 use tokio::sync::mpsc;
 
 use shared::frame;
 use crate::components::resize::ResizeEdges;
 use crate::components::titlebar::TitleBar;
+use crate::components::settings_dialog::SettingsDialog;
 use crate::config::load_config;
 use crate::i18n::{t as tr, tf};
 use crate::i18n::keys;
@@ -45,6 +47,8 @@ pub enum SessionState {
     Idle,
     Connecting,
     Connected,
+    /// Reconnecting to host-service via IPC (includes attempt number)
+    Reconnecting(u32),
     Error(String),
 }
 
@@ -63,6 +67,7 @@ pub fn RemoteView(
     is_fullscreen: Signal<bool>,
 ) -> Element {
     let state            = use_signal(|| SessionState::Connecting);
+    let local_id          = use_signal(|| load_config().local_id);
     let frame_seq        = use_signal(|| 0u64);
     let frame_w          = use_signal(|| frame::DEFAULT_FRAME_W);
     let frame_h          = use_signal(|| frame::DEFAULT_FRAME_H);
@@ -122,8 +127,14 @@ pub fn RemoteView(
             clipboard_tx: clip_tx,
             stats_tx,
         });
+
+        // TODO: Get actual rpc_client from HostCtx and stun_servers from config
+        // For now, create a placeholder - this will need to be properly implemented
+        let rpc_client = Arc::new(crate::rpc_client::RpcClient::new());
+        let stun_servers = vec![]; // Will be loaded from config in production
+
         spawn(run_viewer(
-            srv, rid, lid, qidx, pwd, vs,
+            srv, rid, lid, qidx, pwd, rpc_client, stun_servers.clone(), vs,
             frame_rx, state_rx, clip_rx, input_rx,
             qt_rx, dc_rx, clip_send_rx,
             stats_rx, file_send_rx,
@@ -140,13 +151,18 @@ pub fn RemoteView(
         if scale_mode() == ScaleMode::Original { "flex-start" } else { "center" }
     });
 
+    let show_settings_dialog = use_signal(|| false);
+    let show_lock_dialog = use_signal(|| false);
+
     rsx! {
         div {
             style: "display: flex; flex-direction: column; width: 100vw; height: 100vh;
                     background: var(--bs-body-bg); border: 1px solid var(--bs-border-color);
                     border-radius: 10px; overflow: hidden; user-select: none;
                     color: var(--bs-body-color);",
-            if !is_fullscreen() { TitleBar { title: "RTCDesk", theme, locale } }
+            if !is_fullscreen() {
+                TitleBar { title: "RTCDesk", theme, locale, show_settings_dialog, show_lock_dialog }
+            }
 
             div {
                 tabindex: 0,
@@ -286,6 +302,9 @@ pub fn RemoteView(
                 ResizeEdges {}
             }
         }
+
+        // Settings dialog overlay for remote view too
+        SettingsDialog { show: show_settings_dialog, theme, locale, server_addr, quality, local_id }
     }
 }
 

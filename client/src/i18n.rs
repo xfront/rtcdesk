@@ -225,6 +225,12 @@ pub mod keys {
     pub const TITLE_LIGHT_MODE: &str = "title.light_mode";
     pub const TITLE_DARK_MODE: &str = "title.dark_mode";
 
+    // Titlebar menu
+    pub const MENU_SETTINGS: &str = "menu.settings";
+    pub const MENU_LOCK_UI: &str = "menu.lock_ui";
+    pub const MENU_LOGOUT: &str = "menu.logout";
+    pub const MENU_EXIT: &str = "menu.exit";
+
     // Sidebar
     pub const SIDEBAR_DEVICES: &str = "sidebar.devices";
     pub const SIDEBAR_REMOTE_CTRL: &str = "sidebar.remote_ctrl";
@@ -232,6 +238,18 @@ pub mod keys {
     pub const SIDEBAR_SETTINGS: &str = "sidebar.settings";
     pub const SIDEBAR_LOGGED_IN: &str = "sidebar.logged_in";
     pub const SIDEBAR_NOT_LOGGED_IN: &str = "sidebar.not_logged_in";
+    pub const SIDEBAR_LOGGED_IN_SHORT: &str = "sidebar.logged_in_short";
+    pub const SIDEBAR_NOT_LOGGED_IN_SHORT: &str = "sidebar.not_logged_in_short";
+    pub const SIDEBAR_SECURE_LINK: &str = "sidebar.secure_link";
+    pub const SIDEBAR_LOCK_SET_TITLE: &str = "sidebar.lock_set_title";
+    pub const SIDEBAR_LOCK_SET_HINT: &str = "sidebar.lock_set_hint";
+    pub const SIDEBAR_LOCK_SET_PASSWORD: &str = "sidebar.lock_set_password";
+    pub const SIDEBAR_LOCK_NOW: &str = "sidebar.lock_now";
+    pub const SIDEBAR_LOCK_UNLOCK_TITLE: &str = "sidebar.lock_unlock_title";
+    pub const SIDEBAR_LOCK_UNLOCK_HINT: &str = "sidebar.lock_unlock_hint";
+    pub const SIDEBAR_LOCK_ENTER_PASSWORD: &str = "sidebar.lock_enter_password";
+    pub const SIDEBAR_LOCK_UNLOCK: &str = "sidebar.lock_unlock";
+    pub const SIDEBAR_LOCK_WRONG_PASSWORD: &str = "sidebar.lock_wrong_password";
 
     // Connect
     pub const CONNECT_TITLE_LOCAL: &str = "connect.title_local";
@@ -309,38 +327,143 @@ pub mod keys {
     pub const HOST_SVC_UNINSTALL_OK: &str = "host.svc_uninstall_ok";
     pub const HOST_SVC_UNINSTALL_ERR: &str = "host.svc_uninstall_err";
 
-    // Settings
-    pub const SETTINGS_TITLE: &str = "settings.title";
-    pub const SETTINGS_SUBTITLE: &str = "settings.subtitle";
+    // Settings dialog tabs
+    pub const SETTINGS_TAB_GENERAL: &str = "settings.tab_general";
+    pub const SETTINGS_TAB_SECURITY: &str = "settings.tab_security";
+    pub const SETTINGS_TAB_NETWORK: &str = "settings.tab_network";
+    pub const SETTINGS_TAB_DISPLAY: &str = "settings.tab_display";
+    pub const SETTINGS_TAB_ACCOUNT: &str = "settings.tab_account";
+    pub const SETTINGS_TAB_ABOUT: &str = "settings.tab_about";
+
+    // Settings – General
+    pub const SETTINGS_SERVICE: &str = "settings.service";
+    pub const SETTINGS_SERVICE_START: &str = "settings.service_start";
+    pub const SETTINGS_SERVICE_STOP: &str = "settings.service_stop";
+    pub const SETTINGS_THEME: &str = "settings.theme";
+    pub const SETTINGS_THEME_LIGHT: &str = "settings.theme_light";
+    pub const SETTINGS_THEME_DARK: &str = "settings.theme_dark";
+    pub const SETTINGS_THEME_FOLLOW_SYS: &str = "settings.theme_follow_sys";
+    pub const SETTINGS_LANG: &str = "settings.lang";
+    pub const SETTINGS_HW_CODEC: &str = "settings.hw_codec";
+    pub const SETTINGS_HW_CODEC_ENABLE: &str = "settings.hw_codec_enable";
+    pub const SETTINGS_OTHER: &str = "settings.other";
+    pub const SETTINGS_CONFIRM_CLOSE_TABS: &str = "settings.confirm_close_tabs";
+    pub const SETTINGS_AUTOSTART: &str = "settings.autostart";
+    pub const SETTINGS_MINIMIZE_TO_TRAY: &str = "settings.minimize_to_tray";
+
+    // Settings – Security
+    pub const SETTINGS_SECURITY: &str = "settings.security";
+    pub const SETTINGS_PERMISSIONS: &str = "settings.permissions";
+    pub const SETTINGS_PERM_KEYBOARD: &str = "settings.perm_keyboard";
+    pub const SETTINGS_PERM_CLIPBOARD: &str = "settings.perm_clipboard";
+    pub const SETTINGS_PERM_AUDIO: &str = "settings.perm_audio";
+    pub const SETTINGS_PERM_FILE: &str = "settings.perm_file";
+    pub const SETTINGS_PASSWORD: &str = "settings.password";
+    pub const SETTINGS_PASSWORD_PERMANENT: &str = "settings.password_permanent";
+    pub const SETTINGS_PASSWORD_OTP: &str = "settings.password_otp";
+    pub const SETTINGS_PASSWORD_USE_PERMANENT: &str = "settings.password_use_permanent";
+    pub const SETTINGS_ID_SECTION: &str = "settings.id_section";
+    pub const SETTINGS_CHANGE_ID: &str = "settings.change_id";
+    pub const SETTINGS_LOCK_ON_SESSION_END: &str = "settings.lock_on_session_end";
+    pub const SETTINGS_DENY_LAN_DISCOVERY: &str = "settings.deny_lan_discovery";
+    pub const SETTINGS_APPROVE_MODE_INTERACTIVE: &str = "settings.approve_mode_interactive";
+    // Password access mode
+    pub const SETTINGS_ACCESS_MODE: &str = "settings.access_mode";
+    pub const SETTINGS_ACCESS_MODE_OTP: &str = "settings.access_mode_otp";
+    pub const SETTINGS_ACCESS_MODE_PERMANENT: &str = "settings.access_mode_permanent";
+    pub const SETTINGS_ACCESS_MODE_BOTH: &str = "settings.access_mode_both";
+    pub const SETTINGS_ACCESS_MODE_CLICK: &str = "settings.access_mode_click";
+    pub const SETTINGS_OTP_USE: &str = "settings.otp_use";
+    pub const SETTINGS_OTP_LEN: &str = "settings.otp_len";
+    pub const SETTINGS_OTP_DIGITS_ONLY: &str = "settings.otp_digits_only";
+    pub const SETTINGS_PERM_USE: &str = "settings.perm_use";
+    pub const SETTINGS_PERM_SET_BTN: &str = "settings.perm_set_btn";
+    pub const SETTINGS_BOTH_USE: &str = "settings.both_use";
+    // Set permanent password dialog
+    pub const SETTINGS_SET_PERM_PW_TITLE: &str = "settings.set_perm_pw_title";
+    pub const SETTINGS_SET_PERM_PW_HINT: &str = "settings.set_perm_pw_hint";
+    pub const SETTINGS_SET_PERM_PW_NEW: &str = "settings.set_perm_pw_new";
+    pub const SETTINGS_SET_PERM_PW_CONFIRM: &str = "settings.set_perm_pw_confirm";
+    pub const SETTINGS_SET_PERM_PW_MISMATCH: &str = "settings.set_perm_pw_mismatch";
+    pub const SETTINGS_SET_PERM_PW_EMPTY: &str = "settings.set_perm_pw_empty";
+    pub const SETTINGS_SET_PERM_PW_SAVE: &str = "settings.set_perm_pw_save";
+    pub const SETTINGS_SET_PERM_PW_CLEAR: &str = "settings.set_perm_pw_clear";
+    pub const SETTINGS_SET_PERM_PW_SAVED: &str = "settings.set_perm_pw_saved";
+
+    // Settings – Network
     pub const SETTINGS_NETWORK: &str = "settings.network";
+    pub const SETTINGS_ID_RELAY_SERVER: &str = "settings.id_relay_server";
     pub const SETTINGS_SIGNAL_ADDR: &str = "settings.signal_addr";
     pub const SETTINGS_SIGNAL_HINT: &str = "settings.signal_hint";
     pub const SETTINGS_PLACEHOLDER_HOST: &str = "settings.placeholder_host";
+    pub const SETTINGS_RELAY_SERVER: &str = "settings.relay_server";
+    pub const SETTINGS_RELAY_SERVER_HINT: &str = "settings.relay_server_hint";
+    pub const SETTINGS_PROXY: &str = "settings.proxy";
+    pub const SETTINGS_PROXY_HOST: &str = "settings.proxy_host";
+    pub const SETTINGS_PROXY_HINT: &str = "settings.proxy_hint";
     pub const SETTINGS_STUN: &str = "settings.stun";
     pub const SETTINGS_STUN_HINT: &str = "settings.stun_hint";
     pub const SETTINGS_PLACEHOLDER_STUN: &str = "settings.placeholder_stun";
     pub const SETTINGS_STUN_HELP: &str = "settings.stun_help";
+    pub const SETTINGS_BANDWIDTH: &str = "settings.bandwidth";
+    pub const SETTINGS_BANDWIDTH_KBPS: &str = "settings.bandwidth_kbps";
+    pub const SETTINGS_BANDWIDTH_HINT: &str = "settings.bandwidth_hint";
+
+    // Settings – Display
     pub const SETTINGS_DISPLAY: &str = "settings.display";
-    pub const SETTINGS_QUALITY: &str = "settings.quality";
-    pub const SETTINGS_QUALITY_HINT: &str = "settings.quality_hint";
-    pub const SETTINGS_THEME: &str = "settings.theme";
-    pub const SETTINGS_THEME_HINT: &str = "settings.theme_hint";
-    pub const SETTINGS_THEME_DARK: &str = "settings.theme_dark";
-    pub const SETTINGS_THEME_LIGHT: &str = "settings.theme_light";
-    pub const SETTINGS_THEME_SKY_BLUE: &str = "settings.theme_sky_blue";
-    pub const SETTINGS_THEME_GRASS_GREEN: &str = "settings.theme_grass_green";
-    pub const SETTINGS_THEME_ORANGE: &str = "settings.theme_orange";
-    pub const SETTINGS_THEME_PURPLE: &str = "settings.theme_purple";
-    pub const SETTINGS_LANG: &str = "settings.lang";
-    pub const SETTINGS_LANG_HINT: &str = "settings.lang_hint";
+    pub const SETTINGS_VIEW_STYLE: &str = "settings.view_style";
+    pub const SETTINGS_VIEW_ORIGINAL: &str = "settings.view_original";
+    pub const SETTINGS_VIEW_ADAPTIVE: &str = "settings.view_adaptive";
+    pub const SETTINGS_SCROLL_STYLE: &str = "settings.scroll_style";
+    pub const SETTINGS_SCROLL_AUTO: &str = "settings.scroll_auto";
+    pub const SETTINGS_SCROLL_BAR: &str = "settings.scroll_bar";
+    pub const SETTINGS_IMAGE_QUALITY: &str = "settings.image_quality";
+    pub const SETTINGS_QUALITY_BEST: &str = "settings.quality_best";
+    pub const SETTINGS_QUALITY_BALANCED: &str = "settings.quality_balanced";
+    pub const SETTINGS_QUALITY_LOW: &str = "settings.quality_low";
+    pub const SETTINGS_QUALITY_CUSTOM: &str = "settings.quality_custom";
+    pub const SETTINGS_CODEC: &str = "settings.codec";
+    pub const SETTINGS_CODEC_AUTO: &str = "settings.codec_auto";
+    pub const SETTINGS_CODEC_VP9: &str = "settings.codec_vp9";
+    pub const SETTINGS_CODEC_H264: &str = "settings.codec_h264";
+    pub const SETTINGS_CODEC_H265: &str = "settings.codec_h265";
+    pub const SETTINGS_DISPLAY_OTHER: &str = "settings.display_other";
+    pub const SETTINGS_SYNC_CLIPBOARD: &str = "settings.sync_clipboard";
+    pub const SETTINGS_SHOW_REMOTE_CURSOR: &str = "settings.show_remote_cursor";
+    pub const SETTINGS_SHOW_MONITORS_TOOLBAR: &str = "settings.show_monitors_toolbar";
+    pub const SETTINGS_SHOW_MAGNIFIER: &str = "settings.show_magnifier";
+    pub const SETTINGS_DISABLE_ANIMATIONS: &str = "settings.disable_animations";
+
+    // Settings – Account
+    pub const SETTINGS_ACCOUNT: &str = "settings.account";
+    pub const SETTINGS_BTN_LOGIN: &str = "settings.btn_login";
+    pub const SETTINGS_BTN_LOGOUT: &str = "settings.btn_logout";
+
+    // Settings – About
+    pub const SETTINGS_ABOUT: &str = "settings.about";
+    pub const SETTINGS_ABOUT_TITLE: &str = "settings.about_title";
+    pub const SETTINGS_ABOUT_VER: &str = "settings.about_ver";
+    pub const SETTINGS_ABOUT_BUILD_DATE: &str = "settings.about_build_date";
+    pub const SETTINGS_ABOUT_FINGERPRINT: &str = "settings.about_fingerprint";
+    pub const SETTINGS_ABOUT_PRIVACY: &str = "settings.about_privacy";
+    pub const SETTINGS_ABOUT_WEBSITE: &str = "settings.about_website";
+    pub const SETTINGS_ABOUT_COPYRIGHT: &str = "settings.about_copyright";
+
+    // Shared
+    pub const SETTINGS_TITLE: &str = "settings.title";
     pub const SETTINGS_DEVICE_ID: &str = "settings.device_id";
     pub const SETTINGS_LOCAL_ID: &str = "settings.local_id";
     pub const SETTINGS_LOCAL_ID_HINT: &str = "settings.local_id_hint";
     pub const SETTINGS_BTN_RESET_TOOLTIP: &str = "settings.btn_reset_tooltip";
     pub const SETTINGS_BTN_RESET: &str = "settings.btn_reset";
-    pub const SETTINGS_ABOUT: &str = "settings.about";
-    pub const SETTINGS_ABOUT_VER: &str = "settings.about_ver";
-    pub const SETTINGS_ABOUT_STACK: &str = "settings.about_stack";
+    pub const SETTINGS_QUALITY: &str = "settings.quality";
+    pub const SETTINGS_QUALITY_HINT: &str = "settings.quality_hint";
+    pub const SETTINGS_LANG_HINT: &str = "settings.lang_hint";
+    pub const SETTINGS_THEME_HINT: &str = "settings.theme_hint";
+    pub const SETTINGS_THEME_SKY_BLUE: &str = "settings.theme_sky_blue";
+    pub const SETTINGS_THEME_GRASS_GREEN: &str = "settings.theme_grass_green";
+    pub const SETTINGS_THEME_ORANGE: &str = "settings.theme_orange";
+    pub const SETTINGS_THEME_PURPLE: &str = "settings.theme_purple";
 
     // Auth
     pub const AUTH_ACCOUNT: &str = "auth.account";

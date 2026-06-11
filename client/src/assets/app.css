@@ -111,3 +111,33 @@ input[type=password] { letter-spacing: 2px; }
     font-size: 13px;
     border-radius: 5px;
 }
+
+/* ─── Settings dialog sizing ─────────────────────────────────────────────── */
+
+.modal-dialog.rtcdesk-settings-dialog {
+    max-width: 760px;
+    width: 760px;
+    /* Fixed height so dialog never resizes across panels */
+    height: 540px;
+}
+.modal-dialog.rtcdesk-settings-dialog .modal-content {
+    height: 540px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+.modal-dialog.rtcdesk-settings-dialog .modal-header {
+    padding: 0 10px;
+    height: 32px;
+    min-height: 32px;
+}
+.modal-dialog.rtcdesk-settings-dialog .modal-title {
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 32px;
+}
+.modal-dialog.rtcdesk-settings-dialog .btn-close {
+    width: 12px;
+    height: 12px;
+    padding: 0 10px 0 0;
+}

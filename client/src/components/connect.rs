@@ -28,6 +28,7 @@ pub fn ConnectTab(
     let l: &'static str = Box::leak(locale().into_boxed_str());
     let mut conn_mode = use_signal(|| "desktop".to_string());
     let host_password = use_signal(move || load_config().host_password.clone());
+    let rpc_client = use_context::<std::sync::Arc<std::sync::Mutex<crate::rpc_client::RpcClient>>>();
 
     let addr = server_addr();
     let blocked = remote_id().is_empty();
@@ -110,6 +111,10 @@ pub fn ConnectTab(
                                 cfg.server_addr = addr.clone();
                                 cfg.remote_id   = remote_id();
                                 save_config(&cfg);
+                                
+                                // TODO: Initiate WebRTC connection via RPC
+                                // For now, just navigate to remote page
+                                // The actual connection will happen in the remote view
                                 page.set(Page::Remote);
                             }
                         },
