@@ -23,6 +23,7 @@ futures-util.workspace = true
 futures = "0.3"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+mysql_async = "0.34"
 rusqlite = { version = "0.31", features = ["bundled"] }
 jsonwebtoken = "9"
 argon2 = "0.5"
@@ -32,3 +33,5 @@ ice0.workspace = true
 ice0-macro.workspace = true
 async-trait = "0.1"
 bincode = "1.3"
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+hostname = "0.4"

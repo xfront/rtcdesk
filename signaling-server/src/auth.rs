@@ -34,9 +34,9 @@ impl AuthService {
     ///
     /// 返回 `(user_id, jwt_token)`。
     /// 如果用户名已存在，返回错误。
-    pub fn register(&self, username: &str, password: &str) -> Result<(i64, String)> {
+    pub async fn register(&self, username: &str, password: &str) -> Result<(i64, String)> {
         // 检查用户名是否已存在
-        if self.db.get_user_by_username(username).is_some() {
+        if self.db.get_user_by_username(username).await.is_some() {
             bail!("Username '{}' already exists", username);
         }
 
@@ -44,7 +44,7 @@ impl AuthService {
         let password_hash = self.hash_password(password)?;
 
         // 插入数据库
-        let user_id = self.db.create_user(username, &password_hash)?;
+        let user_id = self.db.create_user(username, &password_hash).await?;
 
         // 签发 JWT
         let token = self.issue_token(user_id, username, PeerRole::Host)?;
@@ -56,10 +56,11 @@ impl AuthService {
     /// 用户登录。
     ///
     /// 验证用户名和密码，成功后返回 (user_id, JWT token)。
-    pub fn login(&self, username: &str, password: &str) -> Result<(i64, String)> {
+    pub async fn login(&self, username: &str, password: &str) -> Result<(i64, String)> {
         let user = self
             .db
             .get_user_by_username(username)
+            .await
             .with_context(|| format!("User '{}' not found", username))?;
 
         // 验证密码

@@ -12,6 +12,8 @@ use ice0::current::Current;
 use ice0::ObjectPrx;
 use shared::ice0_service::HostCallbackPrx;
 
+use crate::cluster::ClusterManager;
+
 /// Callback type for connection disconnect events
 pub type DisconnectCallback = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -28,6 +30,8 @@ pub struct ConnectionManager {
     disconnect_callback: RwLock<Option<DisconnectCallback>>,
     /// Current context for each connected host (allows reverse proxy to HostCallback)
     host_contexts: Arc<Mutex<HashMap<String, HostInfo>>>,
+    /// Optional cluster manager for multi-node deployment
+    cluster: Option<Arc<ClusterManager>>,
 }
 
 impl ConnectionManager {
@@ -35,7 +39,13 @@ impl ConnectionManager {
         Self {
             disconnect_callback: RwLock::new(None),
             host_contexts: Arc::new(Mutex::new(HashMap::new())),
+            cluster: None,
         }
+    }
+
+    /// Set the cluster manager for multi-node support
+    pub fn set_cluster(&mut self, cluster: Arc<ClusterManager>) {
+        self.cluster = Some(cluster);
     }
 
     /// Set the disconnect callback
@@ -60,7 +70,11 @@ impl ConnectionManager {
             });
             info!("Machine {} registered as online (total: {})", host_id, contexts.len());
         }
-        // Note: Current context is used in RPC method directly, not stored here
+        
+        // Sync to cluster if enabled
+        if let Some(cluster) = &self.cluster {
+            cluster.register_host(&host_id).await;
+        }
     }
 
     /// Remove a machine when it disconnects
@@ -69,6 +83,11 @@ impl ConnectionManager {
         
         if contexts.remove(host_id).is_some() {
             info!("Machine {} unregistered (total: {})", host_id, contexts.len());
+            
+            // Sync to cluster if enabled
+            if let Some(cluster) = &self.cluster {
+                cluster.unregister_host(host_id).await;
+            }
             
             // Invoke disconnect callback
             if let Some(callback) = self.disconnect_callback.read().await.as_ref() {

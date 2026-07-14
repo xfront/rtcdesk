@@ -4,6 +4,7 @@
 //! Handles user authentication, machine registration, heartbeat, and online status management.
 
 mod auth;
+mod cluster;
 mod connection;
 mod db;
 mod machine;
@@ -15,12 +16,12 @@ use std::sync::Arc;
 use ice0::prelude::*;
 
 /// 确保至少存在一个默认用户（admin/admin），方便首次启动测试。
-fn ensure_default_admin(db: &db::Database) -> anyhow::Result<()> {
+async fn ensure_default_admin(db: &db::Database) -> anyhow::Result<()> {
     use argon2::password_hash::SaltString;
     use argon2::password_hash::rand_core::OsRng;
     use argon2::{Argon2, PasswordHasher};
 
-    if db.get_user_by_username("admin").is_some() {
+    if db.get_user_by_username("admin").await.is_some() {
         log::info!("Default admin user already exists");
         return Ok(());
     }
@@ -32,7 +33,7 @@ fn ensure_default_admin(db: &db::Database) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to hash default password: {}", e))?
         .to_string();
 
-    db.create_user("admin", &password_hash)?;
+    db.create_user("admin", &password_hash).await?;
     log::info!("Default admin user created (username='admin', password='admin123')");
     Ok(())
 }
@@ -78,11 +79,11 @@ async fn main() -> anyhow::Result<()> {
     let jwt_secret = resolve_jwt_secret();
 
     // 2. 初始化数据库
-    let database = db::Database::new(&db_path)?;
+    let database = db::Database::new(&db_path).await?;
     let db = Arc::new(database);
 
     // 2.1 如果没有用户，创建默认 admin/admin 用户
-    ensure_default_admin(&db)?;
+    ensure_default_admin(&db).await?;
 
     // 3. 初始化认证服务
     let auth_service = Arc::new(auth::AuthService::new(db.clone(), jwt_secret));
@@ -91,7 +92,39 @@ async fn main() -> anyhow::Result<()> {
     let machine_registry = Arc::new(machine::PeerRegistry::new(db.clone(), 90));
 
     // 4.1 初始化连接管理器
-    let connection_manager = Arc::new(connection::ConnectionManager::new());
+    let mut connection_manager = connection::ConnectionManager::new();
+
+    // 4.1.1 初始化集群管理器（如果配置了 Redis）
+    let cluster_manager: Option<Arc<cluster::ClusterManager>> = {
+        let redis_url = std::env::var("RTCDESK_REDIS_URL").unwrap_or_default();
+        if !redis_url.is_empty() {
+            let node_id = std::env::var("RTCDESK_NODE_ID")
+                .unwrap_or_else(|_| hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
+            
+            log::info!("Initializing cluster manager for node '{}' with Redis: {}", node_id, redis_url);
+            match cluster::ClusterManager::new(&redis_url, node_id, bind_addr.clone()).await {
+                Ok(cm) => {
+                    if let Err(e) = cm.start().await {
+                        log::error!("Failed to start cluster manager: {}", e);
+                        None
+                    } else {
+                        let cm = Arc::new(cm);
+                        connection_manager.set_cluster(cm.clone());
+                        Some(cm)
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to create cluster manager: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::info!("Running in standalone mode (no Redis configured)");
+            None
+        }
+    };
+    
+    let connection_manager = Arc::new(connection_manager);
 
     // 4.2 初始化订阅管理器
     let subscription_manager = Arc::new(subscription::SubscriptionManager::new());
@@ -99,17 +132,19 @@ async fn main() -> anyhow::Result<()> {
     // 4.3 设置连接断开回调
     let sub_clone = subscription_manager.clone();
     let db_clone = db.clone();
+    let cluster_for_disconnect = cluster_manager.clone();
     connection_manager
         .set_disconnect_callback(move |host_id| {
             let sub_clone = sub_clone.clone();
             let db_clone = db_clone.clone();
+            let cluster_clone = cluster_for_disconnect.clone();
 
             // Spawn a task to handle the disconnect notification
             tokio::spawn(async move {
                 log::info!("Handling disconnect for machine: {}", host_id);
 
                 // Get machine info from database
-                if let Ok(Some(peer)) = db_clone.get_machine_by_node_id(&host_id) {
+                if let Ok(Some(peer)) = db_clone.get_machine_by_node_id(&host_id).await {
                     let change = shared::ice0_service::PeerStatusChange {
                         node_id: peer.node_id.clone(),
                         name: peer.name.clone(),
@@ -117,14 +152,18 @@ async fn main() -> anyhow::Result<()> {
                         online: false,
                     };
 
-                    // Broadcast offline status to all subscribers of the same user
+                    // Broadcast offline status to local subscribers of the same user
                     log::info!(
                         "Broadcasting offline status for machine {} (user {:?})",
                         host_id,
                         peer.user_id
                     );
                     if let Some(uid) = peer.user_id {
-                        sub_clone.broadcast_peer_status(uid, change).await;
+                        sub_clone.broadcast_peer_status(uid, change.clone()).await;
+                        // Also broadcast across the cluster so other nodes' clients get notified
+                        if let Some(cluster) = &cluster_clone {
+                            cluster.broadcast_peer_status(change).await;
+                        }
                     }
                 } else {
                     log::warn!(
@@ -146,7 +185,41 @@ async fn main() -> anyhow::Result<()> {
         machines: machine_registry.clone(),
         connections: connection_manager.clone(),
         subscriptions: subscription_manager.clone(),
+        cluster: cluster_manager.clone(),
     };
+
+    // 5.1 Set up cluster message handler callbacks (must be before starting the listener)
+    if let Some(cluster) = &cluster_manager {
+        let impl_for_viewer = Arc::new(service_impl.clone());
+        let impl_for_ice = Arc::new(service_impl.clone());
+        let impl_for_status = Arc::new(service_impl.clone());
+
+        let handler = cluster::MessageHandler {
+            on_viewer_request: Arc::new(move |viewer_id, host_id, password, offer_sdp| {
+                let imp = impl_for_viewer.clone();
+                Box::pin(async move {
+                    imp.handle_incoming_viewer_request(viewer_id, host_id, password, offer_sdp).await
+                })
+            }),
+            on_ice_candidate: Arc::new(move |viewer_id, host_id, candidate, sdp_mid, sdp_mline_index| {
+                let imp = impl_for_ice.clone();
+                Box::pin(async move {
+                    imp.handle_incoming_ice_candidate(viewer_id, host_id, candidate, sdp_mid, sdp_mline_index).await
+                })
+            }),
+            on_peer_status: Arc::new(move |change| {
+                let imp = impl_for_status.clone();
+                Box::pin(async move {
+                    imp.handle_remote_peer_status_change(change).await
+                })
+            }),
+        };
+
+        cluster.set_handler(handler).await;
+        if let Err(e) = cluster.start_listener().await {
+            log::error!("Failed to start cluster pub/sub listener: {}", e);
+        }
+    }
 
     // 6. Start ice0 RPC server
     let communicator = Communicator::default().await?;
@@ -170,25 +243,30 @@ async fn main() -> anyhow::Result<()> {
     let mach_clone = machine_registry.clone();
     let sub_clone = subscription_manager.clone();
     let db_clone = db.clone();
+    let cluster_for_heartbeat = cluster_manager.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            match mach_clone.check_timeouts() {
+            match mach_clone.check_timeouts().await {
                 Ok(offlined) => {
                     for node_id in offlined {
                         log::info!("Machine {} timed out, marked offline", node_id);
                         // Broadcast offline status to all subscribers of the same user
-                        if let Ok(Some(peer)) = db_clone.get_machine_by_node_id(&node_id) {
+                        if let Ok(Some(peer)) = db_clone.get_machine_by_node_id(&node_id).await {
                             let change = shared::ice0_service::PeerStatusChange {
                                 node_id: peer.node_id.clone(),
                                 name: peer.name.clone(),
                                 os: peer.os.clone(),
                                 online: false,
                             };
-                            // Broadcast to the same user (if bound)
+                            // Broadcast to local subscribers (if bound)
                             if let Some(uid) = peer.user_id {
-                                sub_clone.broadcast_peer_status(uid, change).await;
+                                sub_clone.broadcast_peer_status(uid, change.clone()).await;
+                                // Also broadcast across the cluster
+                                if let Some(cluster) = &cluster_for_heartbeat {
+                                    cluster.broadcast_peer_status(change).await;
+                                }
                             }
                         }
                     }
@@ -201,6 +279,13 @@ async fn main() -> anyhow::Result<()> {
     // 8. Wait for shutdown
     tokio::signal::ctrl_c().await?;
     log::info!("Shutting down...");
+    
+    // Gracefully stop cluster manager
+    if let Some(cm) = &cluster_manager {
+        if let Err(e) = cm.stop().await {
+            log::warn!("Cluster manager shutdown error: {}", e);
+        }
+    }
     
     Ok(())
 }
